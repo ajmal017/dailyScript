@@ -38,14 +38,19 @@ if __name__ == '__main__':
     License = conf_parser.get('SPINFO', 'license')
     app_id = conf_parser.get('SPINFO', 'appid')
     user_id = conf_parser.get('SPINFO', 'userid')
+
+    db_host = conf_parser.get('MYSQL', 'host')
+    db_user = conf_parser.get('MYSQL', 'user')
+    db_password = conf_parser.get('MYSQL', 'password')
+    db_name = conf_parser.get('MYSQL', 'db')
     initialize()
     print('无任何消息输出时按任意键退出.....')
     info = {'host': host, 'port': int(port), 'License': License, 'app_id': app_id, 'user_id': user_id,
             'password': input('请输入密码：')}
     set_login_info(**info)
     login()
-    conn = pm.connect(host='192.168.2.226', port=3306, user='kairuitouzi', passwd='kairuitouzi',
-                      db='carry_investment')
+    conn = pm.connect(host=db_host, port=3306, user=db_user, passwd=db_password,
+                      db=db_name)
     conn.set_charset('utf8')
 
 
