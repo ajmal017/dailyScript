@@ -7,6 +7,7 @@
 
 import pymysql as pm
 from spapi.spAPI import *
+import getpass
 
 def save_trade(trade):
     trade_dict = dict()
@@ -46,7 +47,7 @@ if __name__ == '__main__':
     initialize()
     print('无任何消息输出时按任意键退出.....')
     info = {'host': host, 'port': int(port), 'License': License, 'app_id': app_id, 'user_id': user_id,
-            'password': input('请输入密码：')}
+            'password': getpass.getpass('请输入密码：')}
     set_login_info(**info)
     login()
     conn = pm.connect(host=db_host, port=3306, user=db_user, passwd=db_password,
