@@ -23,9 +23,9 @@ conf_path = os.path.dirname(__file__)
 conf_parser = configparser.ConfigParser()
 conf_parser.read(os.path.join(conf_path, 'conf.ini'))
 
-addr = conf_parser.get('CTPINFO', 'addr')
-brokerID = conf_parser.get('CTPINFO', 'brokerID')
-userID = conf_parser.get('CTPINFO', 'userID')
+addr = conf_parser.get('CTPINFO_DEMO', 'addr')
+brokerID = conf_parser.get('CTPINFO_DEMO', 'brokerID')
+userID = conf_parser.get('CTPINFO_DEMO', 'userID')
 
 db_host = conf_parser.get('MYSQL', 'host')
 db_user = conf_parser.get('MYSQL', 'user')
@@ -36,23 +36,23 @@ t_api = CTPTrade()
 t_api.connect(userID, input('请输入密码:'), brokerID, addr)
 db = pm.connect(db_host, db_user, db_password, db_name, charset='utf8')
 
-@t_api.register_rtn_callback('OnRtnTrade', log_type='成交入库', log=True)
-def rtn_to_db(trade):
-    trade = struct_format(trade)
-    data = [ ('"' + v + '"' if isinstance(v, str) else str(v))for v in trade.values()]
-    cursor = db.cursor()
-    cursor.execute(f'replace into ctp_trade_records values({",".join(data)})')
-    cursor.close()
-    db.commit()
-
-@t_api.register_rsp_callback('OnRspQryTrade', log_type='成交入库', log=True)
-def rsp_to_db(trade):
-    trade = struct_format(trade)
-    data = [ ('"' + v + '"' if isinstance(v, str) else str(v))for v in trade.values()]
-    cursor = db.cursor()
-    cursor.execute(f'replace into ctp_trade_records values({",".join(data)})')
-    cursor.close()
-    db.commit()
+# @t_api.register_rtn_callback('OnRtnTrade', log_type='成交入库', log=True)
+# def rtn_to_db(trade):
+#     trade = struct_format(trade)
+#     data = [ ('"' + v + '"' if isinstance(v, str) else str(v))for v in trade.values()]
+#     cursor = db.cursor()
+#     cursor.execute(f'replace into ctp_trade_records values({",".join(data)})')
+#     cursor.close()
+#     db.commit()
+#
+# @t_api.register_rsp_callback('OnRspQryTrade', log_type='成交入库', log=True)
+# def rsp_to_db(trade):
+#     trade = struct_format(trade)
+#     data = [ ('"' + v + '"' if isinstance(v, str) else str(v))for v in trade.values()]
+#     cursor = db.cursor()
+#     cursor.execute(f'replace into ctp_trade_records values({",".join(data)})')
+#     cursor.close()
+#     db.commit()
 
 if __name__ == '__main__':
     import sys
@@ -74,6 +74,8 @@ if __name__ == '__main__':
             t_api.qryTrade()
         t_thread = Thread(target=t_api.Join)
         t_thread.start()
+        time.sleep(3)
+        t_api.qryTrade()
 
 
 
