@@ -18,6 +18,7 @@ from threading import Thread
 from pyctp.utils import struct_format, logger
 import configparser
 import os
+import getpass
 
 conf_path = os.path.dirname(__file__)
 conf_parser = configparser.ConfigParser()
@@ -33,7 +34,7 @@ db_password = conf_parser.get('MYSQL', 'password')
 db_name = conf_parser.get('MYSQL', 'db')
 
 t_api = CTPTrade()
-t_api.connect(userID, input('请输入密码:'), brokerID, addr)
+t_api.connect(userID, getpass.getpass('请输入密码：'), brokerID, addr)
 db = pm.connect(db_host, db_user, db_password, db_name, charset='utf8')
 
 # @t_api.register_rtn_callback('OnRtnTrade', log_type='成交入库', log=True)
