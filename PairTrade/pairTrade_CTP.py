@@ -20,6 +20,7 @@ import uuid
 import datetime as dt
 from collections import OrderedDict, ChainMap
 from itertools import chain
+import re
 
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.DEBUG)
@@ -259,6 +260,7 @@ class Trader(TraderApiPy):
         self.investor_id = investor_id.encode()
         self.password = password.encode()
         self._orderRef = 0
+        self._req_queue = Queue()
 
         self._queue = {}
         self._results = {}
@@ -271,6 +273,18 @@ class Trader(TraderApiPy):
         self._instrumentStatus = {}
         self._commissionRates = {}
         self._marginRates = {}
+
+    def insertReq(self, func, struct):
+        self._req_queue.put((func, struct))
+
+    def sendReq(self, current_time):
+        try:
+            func, struct = self._req_queue.get_nowait()
+            func(struct, self.inc_request_id())
+        except Empty:
+            ...
+        except Exception:
+            self.logger.exception(f'<sendReq>{func} -> {struct}')
 
     def ReqOrderInsert(self, pInputOrder, nRequestID):
         self.newOrderEvent.emit(pInputOrder.to_dict())
@@ -333,13 +347,15 @@ class Trader(TraderApiPy):
                       self.ReqQryTrade),
                      ('<on_login_init>发起持仓信息初始化请求',
                       ApiStructure.QryInvestorPositionField(BrokerID=self.broker_id, InvestorID=self.investor_id),
-                      self.ReqQryInvestorPosition)
+                      self.ReqQryInvestorPosition),
+                     ('<on_login_init>发起合约信息初始化请求',
+                      ApiStructure.QryInstrumentField(),
+                      self.ReqQryInstrument),
                      ]
 
         for info, qryField, reqFunc in init_list:
-            time.sleep(1)  # CTP查询限频
             self.logger.info(info)
-            reqFunc(qryField, self.inc_request_id())
+            self.insertReq(reqFunc, qryField)
 
     def OnRspSettlementInfoConfirm(self, pSettlementInfoConfirm, pRspInfo, nRequestID, bIsLast):
         self.logger.info(f'<RspSettlementInfoConfirm>结算确认->{pSettlementInfoConfirm.to_dict()}')
@@ -416,7 +432,7 @@ class Trader(TraderApiPy):
         self.rtnTradeEvent.emit(pTrade_)
 
         qrypostion = ApiStructure.QryInvestorPositionField(InstrumentID=pTrade_.InstrumentID)
-        self.ReqQryInvestorPosition(qrypostion, self.inc_request_id())
+        self.insertReq(self.ReqQryInvestorPosition, qrypostion)
 
     def OnRspQryExchange(self, pExchange, pRspInfo, nRequestID, bIsLast):
         print('OnRspQryExchange', vars())
@@ -425,14 +441,15 @@ class Trader(TraderApiPy):
         print('OnRspQryTradingCode', vars())
 
     def OnRspQryInstrument(self, pInstrument, pRspInfo, nRequestID, bIsLast):
-        pInstrument_ = copy(pInstrument)
-        self.logger.debug(f'<RspQryInstrument>合约查询响应：{pInstrument_}')
-        queue = self._queue.get(nRequestID)
+        if pInstrument is not None:
+            pInstrument_ = copy(pInstrument)
+            self.logger.debug(f'<RspQryInstrument>合约查询响应：{pInstrument_}')
+            queue = self._queue.get(nRequestID)
 
-        if queue is not None:
-            queue.put_nowait(pInstrument_)
+            if queue is not None:
+                queue.put_nowait(pInstrument_)
 
-        self._instruments[pInstrument_.InstrumentID] = pInstrument_
+            self._instruments[pInstrument_.InstrumentID] = pInstrument_
 
         if bIsLast:
             self._EndReq(nRequestID)
@@ -479,7 +496,7 @@ class Trader(TraderApiPy):
             if queue is not None:
                 queue.put_nowait(pInvestorPosition_)
 
-            direction = {b'1': 'NET', b'2': 'LONG', b'3': 'SHORT'}[pInvestorPosition.PosiDirection]
+            direction = {b'1': 'NET', b'2': 'LONG', b'3': 'SHORT'}[pInvestorPosition_.PosiDirection]
             self._positions[direction][pInvestorPosition_.InstrumentID] = pInvestorPosition_
 
         if bIsLast:
@@ -558,7 +575,6 @@ class Trader(TraderApiPy):
 
     def _EndReq(self, nRequestID, success=True):
         queue = self._queue.pop(nRequestID, None)
-
         if queue:
             queue.put_nowait(None)
             result = self._results.pop(nRequestID, [])
@@ -771,7 +787,7 @@ class PairOrders:
     def netExposure(self):
         pos = 0
         neg = 0
-        for ref, order in ChainMap(self.orders, self.extra_orders):
+        for ref, order in ChainMap(self.orders, self.extra_orders).items():
             if order is None:
                 continue
 
@@ -784,15 +800,47 @@ class PairOrders:
 
     @property
     def filled(self):
-        return [o.VolumeTraded for o in self.orders.values()]
+        pos_filled = 0
+        neg_filled = 0
+        for ref, order in ChainMap(self.orders, self.extra_orders).items():
+            if order is None:
+                continue
+
+            if order.Direction == b'0':
+                pos_filled += order.VolumeTraded
+            else:
+                neg_filled += order.VolumeTraded
+
+        return [pos_filled, neg_filled]
 
     @property
     def total(self):
-        return [o.VolumeTotalOriginal for o in self.orders.values()]
+        pos_origin = 0
+        neg_origin = 0
+        for ref, order in ChainMap(self.orders, self.extra_orders).items():
+            if order is None:
+                continue
+
+            if order.Direction == b'0':
+                pos_origin += order.VolumeTotalOriginal
+            else:
+                neg_origin += order.VolumeTotalOriginal
+        return [pos_origin, neg_origin]
 
     @property
     def remaining(self):
-        return [o.VolumeTotal for o in self.orders.values()]
+        pos_remaining = 0
+        neg_remaining = 0
+        for ref, order in ChainMap(self.orders, self.extra_orders).items():
+            if order is None:
+                continue
+
+            if order.Direction == b'0':
+                pos_remaining += order.VolumeTotal if order.OrderStatus not in [b'3', b'1', b'0'] else 0
+            else:
+                neg_remaining += order.VolumeTotal if order.OrderStatus not in [b'3', b'1', b'0'] else 0
+
+        return [pos_remaining, neg_remaining]
 
     def isExpired(self):
         return bool(self.init_time is not None and dt.datetime.now() > self.expireTime)
@@ -821,7 +869,9 @@ class PairOrders:
 
 
 class PairTrader():
+    events = ('timeClockEvent',)
     def __init__(self, broker_id, investor_id, password, MD_SERVER, TD_SERVER):
+        Event.init(self, PairTrader.events)
         self.md = Md(broker_id, investor_id, password)
         self.td = Trader(broker_id, investor_id, password)
         self.md.Create()
@@ -835,13 +885,16 @@ class PairTrader():
         self.td._on_login_init(3)
         logger.debug(f'<API>当前API版本{self.md.GetApiVersion()}')
 
+        self._req_queue = Queue()
         self._pairOrders_running = []
         self._pairOrders_finished = []
 
         self.td.rtnOrderEvent += self.update_pairorder
         self.td.errOpenOrderEvent += self.pairOrder_err_handler
 
-        self.init_unfilled_order_handler()
+        self.timeClockEvent += self.unfilled_order_handle
+        self.timeClockEvent += self.td.sendReq
+        self.init_timeClockTrigger(1)
 
     def pairOrder_err_handler(self, order):  # 处理错单，有错单的情况下立即撤单并平掉其他仓位
         for po in self._pairOrders_running:
@@ -910,11 +963,13 @@ class PairTrader():
         ins1, ins2 = pairInstrumentIDs
         ins1_, ins2_ = ins1.encode(), ins2.encode()
         assert buysell in ['BUY', 'SELL']
-        assert openclose in ['OPEN', 'CLOSE', 'CLOSE_TODAY']
+        assert openclose in ['OPEN', 'CLOSE', 'CLOSE_TODAY', 'SMART']
+        assert all(self.isTrading(pairInstrumentIDs)), '未处于交易时段'
 
         for i in [ins1_, ins2_]:
             if i not in self.md._market_data:
                 self.md.SubscribeMarketData([ins1, ins2])
+                break
 
         first_request_id = self.td.inc_request_id()
         second_request_id = self.td.inc_request_id()
@@ -957,7 +1012,6 @@ class PairTrader():
             if not (ins1_data and ins2_data):
                 return
 
-
             price1 = getattr(ins1_data, ins1_price_name)
             price2 = getattr(ins2_data, ins2_price_name)
             current_spread = price1 - price2
@@ -965,10 +1019,12 @@ class PairTrader():
             # print(buysell, current_spread)
             if comp(current_spread, spread):
                 logger.info(f'<arbitrage>{ins1}->{price1} & {ins2}->{price2} ->spread:{current_spread} 触发{buysell}下单条件:{spread}')
-                first_order.LimitPrice = (price1 - 1) if first_order.Direction == b'0' else (price1 + 1)  # TODO: 测试用，记得修改
-                second_order.LimitPrice = (price2 - 1) if second_order.Direction == b'0' else (price2 + 1)
-                # first_order.LimitPrice = price1
-                # second_order.LimitPrice = price2
+                # first_order.LimitPrice = (price1 - 1) if first_order.Direction == b'0' else (price1 + 1)  # TODO: 测试用，记得修改
+                # second_order.LimitPrice = (price2) if second_order.Direction == b'0' else (price2)
+                if openclose == 'SMART':
+                    self._set_smart_orders([first_order, second_order])
+                first_order.LimitPrice = price1
+                second_order.LimitPrice = price2
                 self.td.ReqOrderInsert(first_order, first_request_id)
                 self.td.ReqOrderInsert(second_order, second_request_id)
                 po.set_init_time()  # 初始化挂单时间
@@ -984,7 +1040,6 @@ class PairTrader():
         pairOrders.finishedEvent.emit()
 
     def _init_pair_order(self, insID, driection, openclose, vol=1):
-        OffsetFlag = {'OPEN': '0', 'CLOSE': '1', 'CLOSE_TODAY': '3'}[openclose]
         order_dict = {'BrokerID': self.td.broker_id,
                       'InvestorID': self.td.investor_id,
                       'InstrumentID': insID,
@@ -993,51 +1048,107 @@ class PairTrader():
                       # 'OrderPriceType': '8' if driection == 'BUY' else 'C',
                       'OrderPriceType': '2',
                       'Direction': '0' if driection == 'BUY' else '1',
-                      'CombOffsetFlag': OffsetFlag,
                       'CombHedgeFlag': '1',
                       'LimitPrice': 0,
                       'VolumeTotalOriginal': vol,
                       'TimeCondition': '3',
                       'VolumeCondition': '1',
-                      'MinVolume': vol,
+                      'MinVolume': 1,
                       'ContingentCondition': '1',
                       'StopPrice': 0.0,
                       'ForceCloseReason': '0',
                       # 'RequestID': reqID
                       }
+        if not openclose == 'SMART':
+            OffsetFlag = {'OPEN': '0', 'CLOSE': '1', 'CLOSE_TODAY': '3'}[openclose]
+            order_dict['CombOffsetFlag'] = OffsetFlag
 
         order = ApiStructure.InputOrderField.from_dict(order_dict)
         return order
+
+    def _set_smart_orders(self, orders):
+        """
+        设置智能报单，如果有仓位会优先选择平仓，需要注意的是仓位小于报单数量时，不会先平后开，而是直接开仓
+        :param orders:
+        :return:
+        """
+        for o in orders:
+            if o.Direction == b'0':
+                pos = self.positions['SHORT'].get(o.InstrumentID.decode())
+                if pos and pos['Position'] >= o.VolumeTotalOriginal:
+                    o.CombOffsetFlag = b'1'
+                else:
+                    o.CombOffsetFlag = b'0'
+            else:
+                pos = self.positions['LONG'].get(o.InstrumentID.decode())
+                if pos and pos['Position'] >= o.VolumeTotalOriginal:
+                    o.CombOffsetFlag = b'1'
+                else:
+                    o.CombOffsetFlag = b'0'
+
 
     def update_pairorder(self, pOrder):
         for po in self._pairOrders_running:
             po.update_order(pOrder)
 
-    def init_unfilled_order_handler(self):  # 开启报单成交逻辑处理线程
-        self._uoh_active = True
-        self._unfilled_order_thread = threading.Thread(target=self.unfilled_order_handle)
-        self._unfilled_order_thread.start()
+    def init_timeClockTrigger(self, seconds):  # 开启报单成交逻辑处理线程
+        assert seconds >= 1
+        self._timeclock_active = True
+        self._timeClockTrigger_thread = threading.Thread(target=self.timeClock, args=(seconds, ))
+        self._timeClockTrigger_thread.start()
 
-    def release_unfilled_order_handler(self):  # 关闭报单成交逻辑处理线程
-        self._uoh_active = False
-        self._unfilled_order_thread.join()
+    def release_timeClockTrigger(self):  # 关闭报单成交逻辑处理线程
+        self._timeclock_active = False
+        self._timeClockTrigger_thread.join()
 
-    def unfilled_order_handle(self):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
-        while True:
-            for po in self._pairOrders_running:
+    def timeClock(self, seconds=1):
+        while self._timeclock_active:
+            self.timeClockEvent.emit(dt.datetime.now())
+            time.sleep(seconds)
 
-                if po.isExpired():
-                    logger.info(f'<unfilled_order_handle>{po}已过期')
-                    try:
-                        self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
-                    except Exception as e:
-                        logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
+    def unfilled_order_handle(self, current_time):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
+        for po in self._pairOrders_running:
 
-            if self._uoh_active:
-                time.sleep(1)  # 每隔一秒执行一次检查
+            if po.isExpired():
+                logger.info(f'<unfilled_order_handle>{po}已过期')
+                try:
+                    self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
+                except Exception as e:
+                    logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
+
+
+    def _handle_expired_pairOrders(self, pairOrders):  # 处理过期的pairorders
+        net = pairOrders.netExposure()
+        pnl = self._calc_pnl(pairOrders)
+        if pnl > 0:  # 如果成交的仓位已盈利，全平仓
+            logger.info(f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 已盈利点数->{pnl}， 全部平仓')
+            for ref, o in ChainMap(pairOrders.orders, pairOrders.extra_orders).items():
+                if  o and o.OrderStatus in [b'3', b'1']:  # 把队列中的报单删除
+                    self._close_after_del(o)
             else:
-                break
+                pairOrders.finishedEvent.emit()
+                return
 
+        if net == 0:
+            logger.info(f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 已盈利点数->{pnl}， 撤销未完全成交报单')
+            for ref, o in ChainMap(pairOrders.orders, pairOrders.extra_orders).items():
+                if  o and o.OrderStatus in [b'3', b'1']:  # 把队列中的报单删除
+                    self._del_remain_order(o)
+            else:
+                pairOrders.finishedEvent.emit()
+
+        elif net > 0:
+            logger.info(f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 理论盈利点数->{pnl}， 撤销所有报单，并平掉暴露仓位')
+            for ref, o in ChainMap(pairOrders.orders, pairOrders.extra_orders).items():
+                if  o and o.OrderStatus in [b'3', b'1']:  # 把队列中的报单删除
+                    self._modify_to_op_price(o, net)
+
+        elif net < 0:
+            logger.info(
+                f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 理论盈利点数->{pnl}， 撤销所有报单，并平掉暴露仓位')
+            for ref, o in ChainMap(pairOrders.orders, pairOrders.extra_orders).items():
+                if o and o.OrderStatus in [b'3', b'1']:  # 把队列中的报单删除
+                    self._modify_to_op_price(o, net)
 
     def _del_remain_order(self, order):  # 删除未成交仓位
         delOrder = ApiStructure.InputOrderActionField(BrokerID=self.td.broker_id, InvestorID=self.td.investor_id,
@@ -1045,44 +1156,16 @@ class PairTrader():
                                                       InstrumentID=order.InstrumentID,
                                                       ActionFlag=b'0')
         self.td.ReqOrderAction(delOrder, self.td.inc_request_id())
-
-    def _handle_expired_pairOrders(self, pairOrders):  # 处理过期的pairorders
-        orders = list(pairOrders.orders.values())
-        extra_orders = list(pairOrders.extra_orders.values())
-
-        net = pairOrders.netExposure()
-        if  self._calc_pnl(pairOrders) > 0:  # 如果成交的仓位已盈利，全平仓
-            for o in chain(orders, extra_orders):
-                if o.OrderStatus in [b'3', b'1']:  # 把队列中的报单删除
-                    self._close_after_del(o)
-            else:
-                pairOrders.finishedEvent.emit()
-                return
-
-
-        if net == 0:
-            for o in chain(orders, extra_orders):
-                if o.OrderStatus in [b'3', b'1']:  # 把队列中的报单删除
-                    self._del_remain_order(o)
-            else:
-                pairOrders.finishedEvent.emit()
-
-        elif net > 0:
-            for o in chain(orders, extra_orders):
-                if o.OrderStatus in [b'3', b'1']:  # 把队列中的报单删除
-                    self._modify_to_op_price(o, net)
-        elif net < 0:
-            for o in chain(orders, extra_orders):
-                if o.OrderStatus in [b'3', b'1']:  # 把队列中的报单删除
-                    self._modify_to_op_price(o, net)
-
+        logger.info(f'<_del_remain_order>报单引用Ref:{order.OrderRef}->发起撤单')
 
     def _modify_to_op_price(self, order, net):
         def insert_after_cancel(o):  # 收到订单取消时间后，马上报新单
-            if o and o.OrderRef == order.OrderRef:
-                price = getattr(self.md._market_data[order.InstrumentID],
-                                'BidPrice1' if order.Direction == b'0' else 'AskPrice1')
+            if o.OrderRef == order.OrderRef:
                 newOrderRef = self.td.inc_order_ref()
+                logger.info(f'<_close_after_del>Ref:{order.OrderRef}撤单成功，同时追对价单Ref:{newOrderRef}')
+                price = getattr(self.md._market_data[order.InstrumentID],
+                                'AskPrice1' if order.Direction == b'0' else 'BidPrice1')
+
                 order_dict = {'BrokerID': self.td.broker_id,
                               'InvestorID': self.td.investor_id,
                               'InstrumentID': order.InstrumentID,
@@ -1091,7 +1174,7 @@ class PairTrader():
                               'Direction': order.Direction,
                               'CombOffsetFlag': order.CombOffsetFlag,
                               'LimitPrice': price,
-                              'VolumeTotalOriginal': net,
+                              'VolumeTotalOriginal': abs(net),
                               'OrderPriceType': '2',
                               'CombHedgeFlag': '1',
                               'TimeCondition': '3',
@@ -1113,15 +1196,19 @@ class PairTrader():
                 self.td.cancelOrderEvent -= insert_after_cancel
 
         if (order.Direction == b'0' and net < 0) or (order.Direction == b'1' and net > 0):
+            logger.debug(f'<_close_after_del>监听Ref:{order.OrderRef}撤单事件->添加追价挂单')
             self.td.cancelOrderEvent += insert_after_cancel  # 撤销事件再次出发挂单事件
+
         self._del_remain_order(order)
 
     def _close_after_del(self, order):
         def insert_after_cancel(o):  # 收到订单取消时间后，马上平仓
-            if o and o.OrderRef == order.OrderRef:
-                price = getattr(self.md._market_data[order.InstrumentID],
-                                'BidPrice1' if order.Direction == b'1' else 'AskPrice1')
+            if o.OrderRef == order.OrderRef:
                 newOrderRef = self.td.inc_order_ref()
+                logger.info(f'<_close_after_del>Ref:{order.OrderRef}撤单成功，同时挂平仓单Ref:{newOrderRef}')
+                price = getattr(self.md._market_data[order.InstrumentID],
+                                'BidPrice1' if order.Direction == b'0' else 'AskPrice1')
+
                 # TODO:可能需要考虑追价，防止遗留仓位
 
                 order_dict = {'BrokerID': self.td.broker_id,
@@ -1154,18 +1241,17 @@ class PairTrader():
                 self.td.cancelOrderEvent -= insert_after_cancel
 
         if order.OrderStatus == b'1':
+            logger.debug(f'<_close_after_del>监听Ref:{order.OrderRef}撤单事件->添加平仓挂单')
             self.td.cancelOrderEvent += insert_after_cancel  # 如果是部分成交，撤单时间触发平仓事件
+
         self._del_remain_order(order)
 
     def _calc_pnl(self, pairOrders):
-        orders = list(pairOrders.orders.values())
-        extra_orders = list(pairOrders.orders.values())
         total_pnl = 0
-
-        for o in chain(orders, extra_orders):
+        for ref, o in ChainMap(pairOrders.orders, pairOrders.extra_orders).items():
             if o is None:
                 continue
-            ticker = self.marketData[o.InstrumentID]
+            ticker = self.md._market_data[o.InstrumentID]
             if o.Direction == b'0':
                 pnl = (ticker.BidPrice1 - o.LimitPrice) * o.VolumeTraded
             else:
@@ -1173,6 +1259,40 @@ class PairTrader():
             total_pnl += pnl
 
         return total_pnl
+
+    def isTrading(self, InstrumentIDs):  # 判断是否处于交易状态
+        status_list = []
+        for insId in InstrumentIDs:
+            reg = re.fullmatch(r'^([a-zA-Z]+)(\d+)$', insId)
+
+            if reg is not None:
+                product = reg[1]
+                if product not in self.instrumentStatus:
+                    raise Exception(f'合约状态不存在该品种{product}，请检查InstrumentID是否正确或是否存在instrumentStatus')
+                else:
+                    status = self.instrumentStatus[product]['InstrumentStatus']
+                    status_list.append(status == '2')
+            else:
+                raise Exception('错误的InstrumentID格式, 请检查InstrumentID!')
+        return status_list
+
+    def checkInstruments(self, InstrumentIDs):
+        ret = {}
+        if self.instruments:
+            for inst in InstrumentIDs:
+                if inst in self.instruments:
+                    ret[inst] = True
+                else:
+                    ret[inst] = False
+            else:
+                return ret
+        else:
+            raise Exception('未有instrument信息，请重新请求QryInstrument')
+
+
+
+
+
 
 if __name__ == "__main__":
     investor_id = "120324"
