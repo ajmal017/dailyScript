@@ -8,7 +8,7 @@
 from ib_insync import *
 import logging
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, ChainMap
 import datetime as dt
 import asyncio
 
@@ -21,7 +21,7 @@ class PairOrders:
               'forwardFilledEvent', 'guardFilledEvent',
               'forwardPartlyFilledEvent', 'guardPartlyFilledEvent',
               'finishedEvent')
-    def __init__(self, pairInstrumentIDs, spread, buysell, vol, tolerant_timedelta, trades):
+    def __init__(self, pairInstrumentIDs, spread, buysell, vol, tolerant_timedelta):
         Event.init(self, PairOrders.events)
         self.id = uuid.uuid1()
         self.pairInstrumentIDs = pairInstrumentIDs
@@ -30,7 +30,8 @@ class PairOrders:
         self.vol = vol
         self.tolerant_timedelta = dt.timedelta(seconds=tolerant_timedelta)
         self.init_time = None
-        self.trades = trades
+        self.trades = OrderedDict()
+        self.extra_trades = OrderedDict()
 
         self._order_log = []
 
@@ -45,6 +46,20 @@ class PairOrders:
             self.init_time = dt.datetime.now()
             self.forwardFilledEvent = self.trades[0].filledEvent
             self.guardFilledEvent = self.trades[1].filledEvent
+
+    def netExposure(self):
+        pos = 0
+        neg = 0
+        for ref, trade in ChainMap(self.trades, self.extra_trades).items():
+            # if order is None:
+            #     continue
+
+            if trade.order.action == 'BUY':
+                pos += trade.filled()
+            else:
+                neg += trade.filled()
+
+        return pos - neg
 
 
     # def update_order(self, pOrder):
@@ -118,8 +133,11 @@ class PairTrader(IB):
         # self.loopUntil()
         # self.waitUntil
 
-        self._pairOrders_running = []
+        self._pairOrders_running = []  #List:
         self._pairOrders_finished = []
+        self._lastUpdateTime = dt.datetime.now()
+        self.updateEvent += self._handle_expired_pairOrders()
+
 
 
     def placePairTrade(self, pairInstruments, spread, buysell, vol=1, tolerant_timedelta=30):
@@ -147,6 +165,14 @@ class PairTrader(IB):
             ins2_direction = 'BUY'
             ins2_price = 'ask'
 
+        def po_finish():
+            if not po._isFinished:
+                po._isFinished = True
+                self._pairOrders_finished.append(po)
+                self._pairOrders_running.remove(po)
+
+        po.finishedEvent += po_finish  # 主要用于配对交易完成的之后的处理，同running队列删除，移至finished队列。包括的情况有完全成交，单腿成交盈利平仓剩余撤单，全部撤单等情况
+
         def arbitrage(ticker):  # 套利下单判断
             price1 = getattr(ticker1, ins1_price)
             price2 = getattr(ticker2, ins2_price)
@@ -157,7 +183,9 @@ class PairTrader(IB):
                 ins2_lmt_order = LimitOrder(ins2_direction, vol, price2)
                 trade1 = self.placeOrder(ticker1.contract, ins1_lmt_order)
                 trade2 = self.placeOrder(ticker2.contract, ins2_lmt_order)
-                po.trades = [trade1, trade2]
+                keys = [self.wrapper.orderKey(o.clientId, o.orderId, o.permId) for o in [ins1_lmt_order, ins2_lmt_order]]
+                for k, t in zip(keys, [trade1, trade2]):
+                    po.trades[k] = t
                 po.set_init_time()
 
 
@@ -176,37 +204,115 @@ class PairTrader(IB):
             if pairOrders in t.updateEvent:
                 t.updateEvent -= pairOrders
 
-    async def _handle_expired_pairOrders(self):
-        while True:
-            await asyncio.sleep(1)
-            async for po in self._pairOrders_running:
-                if all(po.isfilled()):
-                    self._pairOrders_running.remove(po)
-                    self._pairOrders_finished.append(po)
-                else:
-                    for i, t in enumerate(po.trades):
-                        if t.OrderStatus.status == 'Filled':
-                            if t.order.action == 'BUY':
-                                bid = po.tickers[i].bid
-                                order_price = t.order.lmtPrice
+    def unfilled_order_handle(self):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
+        now = dt.datetime.now()
+        if now - self._lastUpdateTime < dt.timedelta(seconds=1):
+            return
+        else:
+            self._lastUpdateTime = now
 
-                                if bid > order_price:  # 获利平仓并撤另一腿
-                                    self.cancelOrder(po.trades[1-i].order)
-                                    close_profit_order = LimitOrder('SELL', t.orderStatus.filled, bid)
-                                    self.placeOrder(t.contract, close_profit_order)
-                                else:  # 否则，则追价未成交的一腿至对价
-                                    self.cancelOrder(po.trades[1 - i].order)
+        for po in self._pairOrders_running:
 
-                            else:
-                                ask = po.tickers[i].ask
-                                order_price = t.order.lmtPrice
+            if po.isExpired():
+                logger.info(f'<unfilled_order_handle>{po}已过期')
+                try:
+                    self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
+                except Exception as e:
+                    logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
 
-                                if ask < order_price:  # 获利平仓并撤另一腿
-                                    self.cancelOrder(po.trades[1-i].order)
-                                    close_profit_order = LimitOrder('BUY', t.orderStatus.filled, ask)
-                                    self.placeOrder(t.contract, close_profit_order)
-                                else:  # 否则，则追价未成交的一腿至对价
-                                    self.cancelOrder(po.trades[1 - i].order)
+
+    def _handle_expired_pairOrders(self, po):
+        net = po.netExposure()
+        pnl = self._calc_pnl(po)
+        if pnl >0:
+            for key, trade in ChainMap(po.trades, po.extra_trades).items():
+                if trade.orderStatus.status in OrderStatus.ActiveStates:  # 把队列中的报单删除
+                    self._close_after_del(trade.order)
+            else:
+                po.finishedEvent.emit()
+                return
+
+        if net == 0:
+            # logger.info(
+            #     f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 已盈利点数->{pnl}， 撤销未完全成交报单')
+            for key, trade in ChainMap(po.trades, po.extra_trades).items():
+                if trade.orderStatus.status in OrderStatus.ActiveStates:  # 把队列中的报单删除
+                    self.cancelOrder(trade.order)
+            else:
+                po.finishedEvent.emit()
+
+        elif net > 0:
+            # logger.info(
+            #     f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 理论盈利点数->{pnl}， 撤销所有报单，并平掉暴露仓位')
+            for key, trade in ChainMap(po.trades, po.extra_trades).items():
+                if trade.orderStatus.status in OrderStatus.ActiveStates:  # 把队列中的报单删除
+                    self._modify_to_op_price(trade, net)
+
+        elif net < 0:
+            # logger.info(
+            #     f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 理论盈利点数->{pnl}， 撤销所有报单，并平掉暴露仓位')
+            for key, trade in ChainMap(po.trades, po.extra_trades).items():
+                if trade.orderStatus.status in OrderStatus.ActiveStates:  # 把队列中的报单删除
+                    self._modify_to_op_price(trade, net)
+
+
+    def _modify_to_op_price(self, trade, net):
+        def insert_after_cancel(t): # 收到订单取消时间后，马上报新单
+            if net < 0:
+                action = 'BUY'
+                price = getattr(self.wrapper.tickers[id(t.contract)], 'ask')
+            elif net > 0:
+                action = 'SELL'
+                price = getattr(self.wrapper.tickers[id(t.contract)], 'bid')
+
+            lmt_order = LimitOrder(action, abs(net), price)
+            new_trade = self.placeOrder(t.contract, lmt_order)
+
+            for po in self._pairOrders_running:
+                if t in ChainMap(po.trades, po.extra_trades).values():
+                    po.extra_trades[
+                        self.wrapper.orderKey(t.order.clientId, t.order.orderId, t.order.permId)] = new_trade
+                    break
+
+        trade.cancelledEvent += insert_after_cancel
+        self.cancelOrder(trade.order)
+
+    def _close_after_del(self, trade):
+        def insert_after_cancel(t): # 收到订单取消时间后，马上平仓
+            if t.order.action == 'SELL':
+                action = 'BUY'
+                price = getattr(self.wrapper.tickers[id(t.contract)], 'ask')
+            else:
+                action = 'SELL'
+                price = getattr(self.wrapper.tickers[id(t.contract)], 'bid')
+
+
+            lmt_order = LimitOrder(action, t.filled(), price)
+            new_trade = self.placeOrder(t.contract, lmt_order)
+
+            for po in self._pairOrders_running:
+                if t in ChainMap(po.trades, po.extra_trades).values():
+                    po.extra_trades[self.wrapper.orderKey(t.order.clientId, t.order.orderId, t.order.permId)] = new_trade
+                    break
+
+
+        trade.cancelledEvent += insert_after_cancel
+        self.cancelOrder(trade.order)
+
+    def _calc_pnl(self, pairOrders):
+        total_pnl = 0
+        for key, t in ChainMap(pairOrders.trades, pairOrders.extra_trades).items():
+            # if t is None:
+            #     continue
+            ticker = self.wrapper.tickers[id(t.contract)]
+            if t.order.action == 'BUY':
+                pnl = (ticker.bid - t.order.lmtPrice) * t.filled() * t.contract.multiplier
+            else:
+                pnl = (ticker.ask - t.order.lmtPrice) * t.filled() * t.contract.multiplier
+
+            total_pnl += pnl
+
+        return total_pnl
 
 
 

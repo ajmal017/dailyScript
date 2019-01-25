@@ -964,7 +964,8 @@ class PairTrader():
         ins1_, ins2_ = ins1.encode(), ins2.encode()
         assert buysell in ['BUY', 'SELL']
         assert openclose in ['OPEN', 'CLOSE', 'CLOSE_TODAY', 'SMART']
-        assert all(self.isTrading(pairInstrumentIDs)), '未处于交易时段'
+        assert all(self.checkInstruments(pairInstrumentIDs)), '不存在合约'
+        assert all(status == '2' for status in self.checkInstStatus(pairInstrumentIDs)), '未处于交易时段'
 
         for i in [ins1_, ins2_]:
             if i not in self.md._market_data:
@@ -1260,38 +1261,37 @@ class PairTrader():
 
         return total_pnl
 
-    def isTrading(self, InstrumentIDs):  # 判断是否处于交易状态
+    def checkInstStatus(self, InstrumentIDs):  # 判断是否处于交易状态
         status_list = []
+        instStatus = self.instrumentStatus
         for insId in InstrumentIDs:
             reg = re.fullmatch(r'^([a-zA-Z]+)(\d+)$', insId)
 
             if reg is not None:
                 product = reg[1]
-                if product not in self.instrumentStatus:
+                if product not in instStatus:
                     raise Exception(f'合约状态不存在该品种{product}，请检查InstrumentID是否正确或是否存在instrumentStatus')
                 else:
-                    status = self.instrumentStatus[product]['InstrumentStatus']
-                    status_list.append(status == '2')
+                    status = instStatus[product]['InstrumentStatus']
+                    status_list.append(status)
             else:
                 raise Exception('错误的InstrumentID格式, 请检查InstrumentID!')
         return status_list
 
     def checkInstruments(self, InstrumentIDs):
-        ret = {}
-        if self.instruments:
+        ret = []
+        inst_dict = self.td._instruments
+        if inst_dict:
             for inst in InstrumentIDs:
-                if inst in self.instruments:
-                    ret[inst] = True
+                inst_ = inst if isinstance(inst, bytes) else inst.encode()
+                if inst_ in inst_dict:
+                    ret.append(True)
                 else:
-                    ret[inst] = False
+                    ret.append(False)
             else:
                 return ret
         else:
             raise Exception('未有instrument信息，请重新请求QryInstrument')
-
-
-
-
 
 
 if __name__ == "__main__":
