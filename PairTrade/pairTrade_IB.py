@@ -12,7 +12,7 @@ from collections import OrderedDict, ChainMap
 import datetime as dt
 import asyncio
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.DEBUG)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger('CTPTrader')
 
 
@@ -33,6 +33,8 @@ class PairOrders:
         self.trades = OrderedDict()
         self.extra_trades = OrderedDict()
 
+        self._filled_queue = asyncio.Queue()
+
         self._order_log = []
 
         self._isFinished = False
@@ -46,6 +48,12 @@ class PairOrders:
             self.init_time = dt.datetime.now()
             self.forwardFilledEvent = self.trades[0].filledEvent
             self.guardFilledEvent = self.trades[1].filledEvent
+
+    async def handle_trade(self):
+        while True:
+            _ = await self._filled_queue.get()
+            if all(trade.orderStatus == 'filled' for trade in self.trades):
+                return True
 
     def netExposure(self):
         pos = 0
@@ -101,8 +109,12 @@ class PairOrders:
     def remaining(self):
         return [o.VolumeTotal for o in self.orders.values()]
 
-    def isExpired(self):
-        return bool(self.init_time is not None and dt.datetime.now() > self.expireTime)
+    async def isExpired(self):
+        secs = (self.init_time + self.tolerant_timedelta - dt.datetime.now()).total_seconds()
+        secs = max(secs, 0)
+        await asyncio.sleep(secs)
+        # return bool(self.init_time is not None and dt.datetime.now() > self.expireTime)
+        return True
 
     def isAllFilled(self):
         return self._allFilled
@@ -136,17 +148,15 @@ class PairTrader(IB):
         self._pairOrders_running = []  #List:
         self._pairOrders_finished = []
         self._lastUpdateTime = dt.datetime.now()
-        self.updateEvent += self._handle_expired_pairOrders()
+        # self.updateEvent += self._handle_expired_pairOrders
 
-
-
-    def placePairTrade(self, pairInstruments, spread, buysell, vol=1, tolerant_timedelta=30):
+    async def placePairTrade(self, pairInstruments, spread, buysell, vol=1, tolerant_timedelta=30):
         assert buysell in ['BUY', 'SELL']
         ins1, ins2 = pairInstruments
         ticker1 = self.reqMktData(ins1)
         ticker2 = self.reqMktData(ins2)
 
-        po = PairOrders(pairInstruments, spread, buysell, vol, tolerant_timedelta, [None, None])
+        po = PairOrders(pairInstruments, spread, buysell, vol, tolerant_timedelta)
         po.tickers = [ticker1, ticker2]
 
         # 组合单预处理
@@ -173,12 +183,14 @@ class PairTrader(IB):
 
         po.finishedEvent += po_finish  # 主要用于配对交易完成的之后的处理，同running队列删除，移至finished队列。包括的情况有完全成交，单腿成交盈利平仓剩余撤单，全部撤单等情况
 
+
         def arbitrage(ticker):  # 套利下单判断
             price1 = getattr(ticker1, ins1_price)
             price2 = getattr(ticker2, ins2_price)
             current_spread = price1 - price2
             print(current_spread)
-            if comp(current_spread, spread):
+            # if comp(current_spread, spread):
+            if True:
                 ins1_lmt_order = LimitOrder(ins1_direction, vol, price1)
                 ins2_lmt_order = LimitOrder(ins2_direction, vol, price2)
                 trade1 = self.placeOrder(ticker1.contract, ins1_lmt_order)
@@ -191,11 +203,14 @@ class PairTrader(IB):
 
                 ticker1.updateEvent -= po
                 ticker2.updateEvent -= po
+                trade1.filledEvent += lambda fill: po._filled_queue.put_nowait(fill)
+                trade2.filledEvent += lambda fill: po._filled_queue.put_nowait(fill)
 
         po.__call__ = arbitrage
         ticker1.updateEvent += po
         ticker2.updateEvent += po
         self._pairOrders_running.append(po)
+        await self.unfilled_order_handle(po)
 
         return po
 
@@ -204,24 +219,34 @@ class PairTrader(IB):
             if pairOrders in t.updateEvent:
                 t.updateEvent -= pairOrders
 
-    def unfilled_order_handle(self):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
-        now = dt.datetime.now()
-        if now - self._lastUpdateTime < dt.timedelta(seconds=1):
-            return
-        else:
-            self._lastUpdateTime = now
+    async def unfilled_order_handle(self, pairOrder):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
+        # now = dt.datetime.now()
+        # if now - self._lastUpdateTime < dt.timedelta(seconds=1):
+        #     return
+        # else:
+        #     self._lastUpdateTime = now
+        try:
+            await asyncio.wait_for(pairOrder.handle_trade(), pairOrder.tolerant_timedelta.total_seconds())
+        except asyncio.TimeoutError:
+            logger.info(f'<unfilled_order_handle>{pairOrder}已过期')
+            try:
+                while pairOrder in self._pairOrders_running:
+                    await self._handle_expired_pairOrders(pairOrder)  # FIXME:可以深入优化
+            except Exception as e:
+                logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
 
-        for po in self._pairOrders_running:
 
-            if po.isExpired():
-                logger.info(f'<unfilled_order_handle>{po}已过期')
-                try:
-                    self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
-                except Exception as e:
-                    logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
+        # async for po in self._pairOrders_running:
+        #
+        #     if po.isExpired():
+        #         logger.info(f'<unfilled_order_handle>{po}已过期')
+        #         try:
+        #             self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
+        #         except Exception as e:
+        #             logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
 
 
-    def _handle_expired_pairOrders(self, po):
+    async def _handle_expired_pairOrders(self, po):
         net = po.netExposure()
         pnl = self._calc_pnl(po)
         if pnl >0:
@@ -254,6 +279,8 @@ class PairTrader(IB):
             for key, trade in ChainMap(po.trades, po.extra_trades).items():
                 if trade.orderStatus.status in OrderStatus.ActiveStates:  # 把队列中的报单删除
                     self._modify_to_op_price(trade, net)
+
+        await asyncio.sleep(1)
 
 
     def _modify_to_op_price(self, trade, net):

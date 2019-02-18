@@ -780,6 +780,7 @@ class PairOrders:
                     self.forwardPartlyFilledEvent.emit()
                 else:
                     self.guardPartlyFilledEvent.emit()
+
         elif pOrder.OrderRef in self.extra_orders:
             self.extra_orders[pOrder.OrderRef] = pOrder  # 更新订单
             self._order_log.append(pOrder)
