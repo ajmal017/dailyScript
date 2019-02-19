@@ -1097,6 +1097,7 @@ class PairTrader():
         assert seconds >= 1
         self._timeclock_active = True
         self._timeClockTrigger_thread = threading.Thread(target=self.timeClock, args=(seconds, ))
+        self._timeClockTrigger_thread.setDaemon(True)
         self._timeClockTrigger_thread.start()
 
     def release_timeClockTrigger(self):  # 关闭报单成交逻辑处理线程
