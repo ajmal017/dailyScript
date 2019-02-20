@@ -15,6 +15,7 @@ import threading
 from copy import copy
 from queue import Queue, Empty
 import logging
+from logging.handlers import SMTPHandler
 import time
 import uuid
 import datetime as dt
@@ -25,6 +26,11 @@ import re
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.DEBUG)
 logger = logging.getLogger('CTPTrader')
+# smtpHandler = SMTPHandler('smtp.163.com', '13580726532@163.com', '137150224@qq.com',
+#                           'CTPTrader Fatal', ('13580726532@163.com', ''))
+# smtpHandler.setLevel(logging.FATAL)
+# logger.addHandler(smtpHandler)
+
 
 
 class Event:
@@ -337,8 +343,12 @@ class Trader(TraderApiPy):
     def _on_login_init(self, delay):
 
         init_list = [('<on_login_init>发起账户初始化请求',
-                      ApiStructure.QryTradingAccountField(BrokerID=self.broker_id, InvestorID=self.investor_id, BizType=' '),
+                      ApiStructure.QryTradingAccountField(BrokerID=self.broker_id, InvestorID=self.investor_id,
+                                                          BizType=' '),
                       self.ReqQryTradingAccount),
+                     ('<on_login_init>发起合约信息初始化请求',
+                      ApiStructure.QryInstrumentField(),
+                      self.ReqQryInstrument),
                      ('<on_login_init>发起订单信息初始化请求',
                       ApiStructure.QryOrderField(BrokerID=self.broker_id, InvestorID=self.investor_id),
                       self.ReqQryOrder),
@@ -348,9 +358,6 @@ class Trader(TraderApiPy):
                      ('<on_login_init>发起持仓信息初始化请求',
                       ApiStructure.QryInvestorPositionField(BrokerID=self.broker_id, InvestorID=self.investor_id),
                       self.ReqQryInvestorPosition),
-                     ('<on_login_init>发起合约信息初始化请求',
-                      ApiStructure.QryInstrumentField(),
-                      self.ReqQryInstrument),
                      ]
 
         for info, qryField, reqFunc in init_list:
@@ -490,7 +497,7 @@ class Trader(TraderApiPy):
     def OnRspQryInvestorPosition(self, pInvestorPosition, pRspInfo, nRequestID, bIsLast):
         if pInvestorPosition is not None:
             pInvestorPosition_ = copy(pInvestorPosition)
-            self.logger.debug(f'<RspQryInstrument>持仓查询响应：{pInvestorPosition_}')
+            self.logger.debug(f'<RspQryInvestorPosition>持仓查询响应：{pInvestorPosition_}')
             queue = self._queue.get(nRequestID)
 
             if queue is not None:
@@ -505,7 +512,7 @@ class Trader(TraderApiPy):
     def OnRspQryInvestorPositionDetail(self, pInvestorPositionDetail, pRspInfo, nRequestID, bIsLast):
         if pInvestorPositionDetail is not None:
             pInvestorPositionDetail_ = copy(pInvestorPositionDetail)
-            self.logger.debug(f'<RspQryInstrument>持仓查询响应：{pInvestorPositionDetail_}')
+            self.logger.debug(f'<RspQryInvestorPositionDetail>持仓查询响应：{pInvestorPositionDetail_}')
             queue = self._queue.get(nRequestID)
 
             if queue is not None:
@@ -664,8 +671,9 @@ class Trader(TraderApiPy):
             self._QryFailed('QryInstrument', 'Timeout')
             return
 
-    def QryCommissionRate(self, **kwargs):
-        CommissionRate = ApiStructure.QryInstrumentCommissionRateField(BrokerID=self.broker_id, InvestorID=self.investor_id, **kwargs)
+    def QryCommissionRate(self, InstrumentID, **kwargs):
+        CommissionRate = ApiStructure.QryInstrumentCommissionRateField(BrokerID=self.broker_id, InvestorID=self.investor_id,
+                                                                       InstrumentID=InstrumentID, **kwargs)
         request_id = self.inc_request_id()
         queue, result = self._StartReq(request_id)
         self.ReqQryInstrumentCommissionRate(CommissionRate, request_id)
@@ -681,9 +689,10 @@ class Trader(TraderApiPy):
             self._QryFailed('QryCommissionRate', 'Timeout')
             return
 
-    def QryMarginRate(self, **kwargs):
+    def QryMarginRate(self, InstrumentID, **kwargs):
         kwargs.setdefault('HedgeFlag', b' ')
-        MarginRate = ApiStructure.QryInstrumentMarginRateField(BrokerID=self.broker_id, InvestorID=self.investor_id, **kwargs)
+        MarginRate = ApiStructure.QryInstrumentMarginRateField(BrokerID=self.broker_id, InvestorID=self.investor_id,
+                                                               InstrumentID=InstrumentID, **kwargs)
         request_id = self.inc_request_id()
         queue, result = self._StartReq(request_id)
         self.ReqQryInstrumentMarginRate(MarginRate, request_id)
@@ -863,7 +872,7 @@ class PairOrders:
         return self.init_time + self.tolerant_timedelta
 
     def __repr__(self):
-        return f'<PairOrder: {self.id}> instrument:{self.pairInstrumentIDs} spread:{self.spread} direction:{self.buysell}'
+        return f'<PairOrder: {self.id}> instrument:{self.pairInstrumentIDs} spread:{self.spread} direction:{self.buysell} openclose:{self.openclose}'
 
     def __iter__(self):
         return self.orders.items().__iter__()
@@ -891,6 +900,7 @@ class PairTrader():
         self._pairOrders_finished = []
 
         self.td.rtnOrderEvent += self.update_pairorder
+        self.td.rtnTradeEvent += self.qry_commission
         self.td.errOpenOrderEvent += self.pairOrder_err_handler
 
         self.timeClockEvent += self.unfilled_order_handle
@@ -905,6 +915,15 @@ class PairTrader():
                     if o is not None:
                         self._close_after_del(o)
                 break
+
+    def qry_commission(self, trade):
+        InstrumentID = trade.InstrumentID
+        prodId = self.td._instruments[InstrumentID].ProductID
+        if prodId not in self.td._commissionRates:
+            qryCommissionRate = ApiStructure.QryInstrumentCommissionRateField(BrokerID=self.td.broker_id,
+                                                                           InvestorID=self.td.investor_id,
+                                                                           InstrumentID=InstrumentID)
+            self.td.insertReq(self.td.ReqQryInstrumentCommissionRate, qryCommissionRate)
 
     @property
     def orders(self):
@@ -965,8 +984,10 @@ class PairTrader():
         ins1_, ins2_ = ins1.encode(), ins2.encode()
         assert buysell in ['BUY', 'SELL']
         assert openclose in ['OPEN', 'CLOSE', 'CLOSE_TODAY', 'SMART']
-        assert all(self.checkInstruments(pairInstrumentIDs)), '不存在合约'
+        assert all(self.checkInstruments([ins1_, ins2_])), '不存在合约'
         assert all(status == '2' for status in self.checkInstStatus(pairInstrumentIDs)), '未处于交易时段'
+        if openclose in ['CLOSE', 'CLOSE_TODAY']:
+            assert all(self.checkPosition([ins1_, ins2_], buysell, vol)), '未持有仓位，不能下平仓单'
 
         for i in [ins1_, ins2_]:
             if i not in self.md._market_data:
@@ -1088,7 +1109,6 @@ class PairTrader():
                 else:
                     o.CombOffsetFlag = b'0'
 
-
     def update_pairorder(self, pOrder):
         for po in self._pairOrders_running:
             po.update_order(pOrder)
@@ -1110,14 +1130,17 @@ class PairTrader():
             time.sleep(seconds)
 
     def unfilled_order_handle(self, current_time):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
-        for po in self._pairOrders_running:
 
+        for po in self._pairOrders_running:
             if po.isExpired():
                 logger.info(f'<unfilled_order_handle>{po}已过期')
                 try:
                     self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
                 except Exception as e:
                     logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
+
+            if po.init_time is not None and (current_time - po.expireTime).total_seconds() > 60:
+                logger.fatal(f'<unfilled_order_handle>##{po}***********报单处理异常超时60s**************')
 
 
     def _handle_expired_pairOrders(self, pairOrders):  # 处理过期的pairorders
@@ -1250,20 +1273,50 @@ class PairTrader():
         self._del_remain_order(order)
 
     def _calc_pnl(self, pairOrders):
+        """
+        计算该交易对的理论盈亏情况
+        :param pairOrders:
+        :return:
+        """
         total_pnl = 0
+        commission = 0
         for ref, o in ChainMap(pairOrders.orders, pairOrders.extra_orders).items():
             if o is None:
                 continue
             ticker = self.md._market_data[o.InstrumentID]
+            ins = self.td._instruments[o.InstrumentID]
+            commissionRate = self.td._commissionRates.get(ins.ProductID)
+
+            if commissionRate:
+                if o.CombHedgeFlag == b'0':
+                    commissionByMoney = commissionRate.OpenRatioByMoney * (ticker.LastPrice + o.LimitPrice) * o.VolumeTraded
+                    commissionByVolume = commissionRate.OpenRatioByVolume * o.VolumeTraded * 2
+                elif o.CombHedgeFlag == b'1':
+                    commissionByMoney = commissionRate.CloseRatioByMoney * (ticker.LastPrice + o.LimitPrice) * o.VolumeTraded
+                    commissionByVolume = commissionRate.CloseRatioByVolume * o.VolumeTraded * 2
+                else:
+                    commissionByMoney = commissionRate.CloseTodayRatioByMoney * (ticker.LastPrice + o.LimitPrice) * o.VolumeTraded
+                    commissionByVolume = commissionRate.CloseTodayRatioByVolume * o.VolumeTraded * 2
+
+                commission += max(commissionByMoney, commissionByVolume)
+
+
+
             if o.Direction == b'0':
                 pnl = (ticker.BidPrice1 - o.LimitPrice) * o.VolumeTraded
             else:
                 pnl = (o.LimitPrice - ticker.AskPrice1) * o.VolumeTraded
+
             total_pnl += pnl
 
-        return total_pnl
+        return total_pnl - commission
 
     def checkInstStatus(self, InstrumentIDs):  # 判断是否处于交易状态
+        """
+        检查产品是否处于交易状态
+        :param InstrumentIDs:
+        :return:
+        """
         status_list = []
         instStatus = self.instrumentStatus
         for insId in InstrumentIDs:
@@ -1280,12 +1333,16 @@ class PairTrader():
                 raise Exception('错误的InstrumentID格式, 请检查InstrumentID!')
         return status_list
 
-    def checkInstruments(self, InstrumentIDs):
+    def checkInstruments(self, InstrumentIDs_):
+        """
+        检查是否存在该合约
+        :param InstrumentIDs_:
+        :return:
+        """
         ret = []
         inst_dict = self.td._instruments
         if inst_dict:
-            for inst in InstrumentIDs:
-                inst_ = inst if isinstance(inst, bytes) else inst.encode()
+            for inst_ in InstrumentIDs_:
                 if inst_ in inst_dict:
                     ret.append(True)
                 else:
@@ -1294,6 +1351,26 @@ class PairTrader():
                 return ret
         else:
             raise Exception('未有instrument信息，请重新请求QryInstrument')
+
+    def checkPosition(self, InstrumentIDs_, buysell, vol):
+        """
+        检查是否有持仓
+        :param InstrumentIDs_:
+        :param buysell:
+        :param vol:
+        :return:
+        """
+        if buysell == 'BUY':
+            inst1 = self.td._positions['SHORT'].get(InstrumentIDs_[0])
+            inst2 = self.td._positions['LONG'].get(InstrumentIDs_[1])
+        else:
+            inst1 = self.td._positions['LONG'].get(InstrumentIDs_[0])
+            inst2 = self.td._positions['SHORT'].get(InstrumentIDs_[1])
+
+        isInst1GetPos = bool(inst1 and inst1.Position >= vol)
+        isInst2GetPos = bool(inst2 and inst2.Position >= vol)
+
+        return isInst1GetPos, isInst2GetPos
 
 
 if __name__ == "__main__":
