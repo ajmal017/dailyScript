@@ -340,7 +340,7 @@ class Trader(TraderApiPy):
             req = ApiStructure.SettlementInfoConfirmField(BrokerID=self.broker_id, InvestorID=self.investor_id)
             self.ReqSettlementInfoConfirm(req, self.inc_request_id())
 
-    def _on_login_init(self, delay):
+    def _on_login_init(self):
 
         init_list = [('<on_login_init>发起账户初始化请求',
                       ApiStructure.QryTradingAccountField(BrokerID=self.broker_id, InvestorID=self.investor_id,
@@ -751,7 +751,6 @@ class PairOrders:
         self._order_log = []
 
         self._isFinished = False
-
         self._forwardFilled = False
         self._guardFilled = False
         self._allFilled = False
@@ -892,7 +891,7 @@ class PairTrader():
         self.td.SubscribePrivateTopic(1) # 只传送登录后的流内容
         self.md.Init()
         self.td.Init()
-        self.td._on_login_init(3)
+        self.td._on_login_init()
         logger.debug(f'<API>当前API版本{self.md.GetApiVersion()}')
 
         self._req_queue = Queue()
@@ -906,24 +905,6 @@ class PairTrader():
         self.timeClockEvent += self.unfilled_order_handle
         self.timeClockEvent += self.td.sendReq
         self.init_timeClockTrigger(1)
-
-    def pairOrder_err_handler(self, order):  # 处理错单，有错单的情况下立即撤单并平掉其他仓位
-        for po in self._pairOrders_running:
-            if order.OrderRef in po.orders:
-                po.finishedEvent.emit()
-                for ref, o in po:
-                    if o is not None:
-                        self._close_after_del(o)
-                break
-
-    def qry_commission(self, trade):
-        InstrumentID = trade.InstrumentID
-        prodId = self.td._instruments[InstrumentID].ProductID
-        if prodId not in self.td._commissionRates:
-            qryCommissionRate = ApiStructure.QryInstrumentCommissionRateField(BrokerID=self.td.broker_id,
-                                                                           InvestorID=self.td.investor_id,
-                                                                           InstrumentID=InstrumentID)
-            self.td.insertReq(self.td.ReqQryInstrumentCommissionRate, qryCommissionRate)
 
     @property
     def orders(self):
@@ -977,7 +958,7 @@ class PairTrader():
         data = copy(self.td._account)
         return data.to_dict()
 
-# -------------------------------------配对交易-----------------------------------------------------------------------------------
+# -------------------------------------配对交易-------------------------------------------------------------------------
     def placePairTrade(self, pairInstrumentIDs, spread, buysell, openclose, vol=1, tolerant_timedelta=30):
         logger.info(f'<placePairTrade>配对交易下单{pairInstrumentIDs} spread:{spread} buysell:{buysell} openclose:{openclose}')
         ins1, ins2 = pairInstrumentIDs
@@ -1062,6 +1043,59 @@ class PairTrader():
         self.md.marketDataUpdateEvent -= pairOrders._trigger
         pairOrders.finishedEvent.emit()
 
+    def getSpread(self, pairInstrumentIDs):
+        mkData1 = self.md._market_data.get(
+            pairInstrumentIDs[0] if isinstance(pairInstrumentIDs[0], bytes) else pairInstrumentIDs[0].encode())
+        mkData2 = self.md._market_data.get(
+            pairInstrumentIDs[1] if isinstance(pairInstrumentIDs[1], bytes) else pairInstrumentIDs[1].encode())
+
+        if mkData1 and mkData2:
+            return mkData1.LastPrice - mkData2.LastPrice
+        else:
+            raise Exception('未订阅数据')
+
+    # def showPairMKData(self, pairInstrumentIDs, time_delta=1):
+    #     while True:
+    #         try:
+    #             spread = self.getSpread(pairInstrumentIDs)
+    #         except KeyboardInterrupt:
+    #             break
+    #         else:
+    #             print(f'\rspread:{spread}', end='')
+    #             time.sleep(time_delta)
+
+
+# -------------------------------------时间触发-------------------------------------------------------------------------
+    def init_timeClockTrigger(self, seconds):  # 开启报单成交逻辑处理线程
+        assert seconds >= 1
+        self._timeclock_active = True
+        self._timeClockTrigger_thread = threading.Thread(target=self.timeClock, args=(seconds, ))
+        self._timeClockTrigger_thread.setDaemon(True)
+        self._timeClockTrigger_thread.start()
+
+    def release_timeClockTrigger(self):  # 关闭报单成交逻辑处理线程
+        self._timeclock_active = False
+        self._timeClockTrigger_thread.join()
+
+    def timeClock(self, seconds=1):  # 基于时钟的时间触发，
+        while self._timeclock_active:
+            self.timeClockEvent.emit(dt.datetime.now())
+            time.sleep(seconds)
+
+    def unfilled_order_handle(self, current_time):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
+        for po in self._pairOrders_running:
+            if po.isExpired():
+                logger.info(f'<unfilled_order_handle>{po}已过期')
+                try:
+                    self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
+                except Exception as e:
+                    logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
+
+            if po.init_time is not None and (current_time - po.expireTime).total_seconds() > 60:
+                # 如果出现处理过期配对交易时间超过一分钟的话，直接fatal发邮件报异常
+                logger.fatal(f'<unfilled_order_handle>##{po}***********报单处理异常超时60s**************')
+
+# ------------------------------------配对下单处理函数------------------------------------------------------------------
     def _init_pair_order(self, insID, driection, openclose, vol=1):
         order_dict = {'BrokerID': self.td.broker_id,
                       'InvestorID': self.td.investor_id,
@@ -1109,40 +1143,6 @@ class PairTrader():
                 else:
                     o.CombOffsetFlag = b'0'
 
-    def update_pairorder(self, pOrder):
-        for po in self._pairOrders_running:
-            po.update_order(pOrder)
-
-    def init_timeClockTrigger(self, seconds):  # 开启报单成交逻辑处理线程
-        assert seconds >= 1
-        self._timeclock_active = True
-        self._timeClockTrigger_thread = threading.Thread(target=self.timeClock, args=(seconds, ))
-        self._timeClockTrigger_thread.setDaemon(True)
-        self._timeClockTrigger_thread.start()
-
-    def release_timeClockTrigger(self):  # 关闭报单成交逻辑处理线程
-        self._timeclock_active = False
-        self._timeClockTrigger_thread.join()
-
-    def timeClock(self, seconds=1):
-        while self._timeclock_active:
-            self.timeClockEvent.emit(dt.datetime.now())
-            time.sleep(seconds)
-
-    def unfilled_order_handle(self, current_time):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
-
-        for po in self._pairOrders_running:
-            if po.isExpired():
-                logger.info(f'<unfilled_order_handle>{po}已过期')
-                try:
-                    self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
-                except Exception as e:
-                    logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
-
-            if po.init_time is not None and (current_time - po.expireTime).total_seconds() > 60:
-                logger.fatal(f'<unfilled_order_handle>##{po}***********报单处理异常超时60s**************')
-
-
     def _handle_expired_pairOrders(self, pairOrders):  # 处理过期的pairorders
         net = pairOrders.netExposure()
         pnl = self._calc_pnl(pairOrders)
@@ -1185,6 +1185,12 @@ class PairTrader():
         logger.info(f'<_del_remain_order>报单引用Ref:{order.OrderRef}->发起撤单')
 
     def _modify_to_op_price(self, order, net):
+        """
+        追价成交撸平暴露头寸
+        :param order:
+        :param net:
+        :return:
+        """
         def insert_after_cancel(o):  # 收到订单取消时间后，马上报新单
             if o.OrderRef == order.OrderRef:
                 newOrderRef = self.td.inc_order_ref()
@@ -1228,6 +1234,11 @@ class PairTrader():
         self._del_remain_order(order)
 
     def _close_after_del(self, order):
+        """
+        平掉暴露头寸并删除剩余未成交订单
+        :param order:
+        :return:
+        """
         def insert_after_cancel(o):  # 收到订单取消时间后，马上平仓
             if o.OrderRef == order.OrderRef:
                 newOrderRef = self.td.inc_order_ref()
@@ -1311,6 +1322,30 @@ class PairTrader():
 
         return total_pnl - commission
 
+# ---------------------------------------------事件触发处理-------------------------------------------------------------
+    def pairOrder_err_handler(self, order):  # 处理错单，有错单的情况下立即撤单并平掉其他仓位
+        for po in self._pairOrders_running:
+            if order.OrderRef in po.orders:
+                po.finishedEvent.emit()
+                for ref, o in po:
+                    if o is not None:
+                        self._close_after_del(o)
+                break
+
+    def qry_commission(self, trade):
+        InstrumentID = trade.InstrumentID
+        prodId = self.td._instruments[InstrumentID].ProductID
+        if prodId not in self.td._commissionRates:
+            qryCommissionRate = ApiStructure.QryInstrumentCommissionRateField(BrokerID=self.td.broker_id,
+                                                                              InvestorID=self.td.investor_id,
+                                                                              InstrumentID=InstrumentID)
+            self.td.insertReq(self.td.ReqQryInstrumentCommissionRate, qryCommissionRate)
+
+    def update_pairorder(self, pOrder):
+        for po in self._pairOrders_running:
+            po.update_order(pOrder)
+
+# --------------------------------------配对下单检查--------------------------------------------------------------------
     def checkInstStatus(self, InstrumentIDs):  # 判断是否处于交易状态
         """
         检查产品是否处于交易状态
