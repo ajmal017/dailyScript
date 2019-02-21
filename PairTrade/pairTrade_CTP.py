@@ -335,10 +335,11 @@ class Trader(TraderApiPy):
             self._orderRef = int(pRspUserLogin.MaxOrderRef)
 
             inv = ApiStructure.QryInvestorField(BrokerID=self.broker_id, InvestorID=self.investor_id)
-            self.ReqQryInvestor(inv, self.inc_request_id())
+            self.insertReq(self.ReqQryInvestor, inv)
 
-            req = ApiStructure.SettlementInfoConfirmField(BrokerID=self.broker_id, InvestorID=self.investor_id)
-            self.ReqSettlementInfoConfirm(req, self.inc_request_id())
+            settlementConfirm = ApiStructure.SettlementInfoConfirmField(BrokerID=self.broker_id, InvestorID=self.investor_id)
+            self.insertReq(self.ReqSettlementInfoConfirm, settlementConfirm)
+
 
     def _on_login_init(self):
 
