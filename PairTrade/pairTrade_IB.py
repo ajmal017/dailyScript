@@ -15,6 +15,7 @@ import asyncio
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger('IBTrader')
 
+util.patchAsyncio()
 
 class PairOrders:
     events = ('orderUpdateEvent', 'allFilledEvent',
@@ -45,16 +46,23 @@ class PairOrders:
         self._guardFilled = False
         self._allFilled = False
 
+    def __call__(self, *args, **kwargs):
+        self._trigger(*args, **kwargs)
+
+    def _trigger(self, *args, **kwargs):
+        ...
+
     def set_init_time(self):
         if self.init_time is None:
             self.init_time = dt.datetime.now()
-            self.forwardFilledEvent = self.trades[0].filledEvent
-            self.guardFilledEvent = self.trades[1].filledEvent
+            trades = list(self.trades.values())
+            self.forwardFilledEvent = trades[0].filledEvent
+            self.guardFilledEvent = trades[0].filledEvent
 
     async def handle_trade(self):
         while True:
             _ = await self._filled_queue.get()
-            if all(trade.orderStatus == 'filled' for trade in self.trades):
+            if all(trade.orderStatus == 'filled' for key, trade in self.trades.items()):
                 return True
 
     async def status(self):
@@ -72,10 +80,10 @@ class PairOrders:
                 _filled = t.filled()
                 if t.order.action == 'BUY':
                     pos += _filled
-                    pnl = (ticker.bid - t.order.lmtPrice) * _filled * t.contract.multiplier
+                    pnl = (ticker.bid - t.order.lmtPrice) * _filled * int(t.contract.multiplier)
                 else:
                     neg += _filled
-                    pnl = (ticker.ask - t.order.lmtPrice) * _filled * t.contract.multiplier
+                    pnl = (ticker.ask - t.order.lmtPrice) * _filled * int(t.contract.multiplier)
 
                 net = pos - neg
                 total_pnl += pnl
@@ -125,8 +133,6 @@ class PairTrader(IB):
     def __init__(self, host, port, clientId=0, timeout=10):
         super(PairTrader, self).__init__()
         self.connect(host, port, clientId=clientId, timeout=timeout)
-        # self.loopUntil()
-        # self.waitUntil
 
         self._pairOrders_running = []  #List:
         self._pairOrders_finished = []
@@ -167,7 +173,10 @@ class PairTrader(IB):
         po.finishedEvent += po_finish  # 主要用于配对交易完成的之后的处理，同running队列删除，移至finished队列。包括的情况有完全成交，单腿成交盈利平仓剩余撤单，全部撤单等情况
 
 
-        def arbitrage(ticker):  # 套利下单判断
+        def arbitrage(pendingTickers):  # 套利下单判断
+            if all(ticker not in [ticker1, ticker2] for ticker in pendingTickers):
+                print('no ticker')
+                return
             price1 = getattr(ticker1, ins1_price)
             price2 = getattr(ticker2, ins2_price)
             current_spread = price1 - price2
@@ -183,14 +192,12 @@ class PairTrader(IB):
                     po.trades[k] = t
                 po.set_init_time()
 
-                ticker1.updateEvent -= po
-                ticker2.updateEvent -= po
+                self.pendingTickersEvent -= po
                 trade1.filledEvent += lambda fill: po._filled_queue.put_nowait(fill)
                 trade2.filledEvent += lambda fill: po._filled_queue.put_nowait(fill)
 
-        po.__call__ = arbitrage
-        ticker1.updateEvent += po
-        ticker2.updateEvent += po
+        po._trigger = arbitrage
+        self.pendingTickersEvent += po
         self._pairOrders_running.append(po)
         await self.unfilled_order_handle(po)
 
@@ -211,16 +218,6 @@ class PairTrader(IB):
                     await self._handle_expired_pairOrders(pairOrder)  # FIXME:可以深入优化
             except Exception as e:
                 logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
-
-
-        # async for po in self._pairOrders_running:
-        #
-        #     if po.isExpired():
-        #         logger.info(f'<unfilled_order_handle>{po}已过期')
-        #         try:
-        #             self._handle_expired_pairOrders(po)  # FIXME:可以深入优化
-        #         except Exception as e:
-        #             logger.exception(f'<unfilled_order_handle>处理过期配对报单错误')
 
 
     async def _handle_expired_pairOrders(self, po):
