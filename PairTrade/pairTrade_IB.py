@@ -140,8 +140,9 @@ class PairTrader(IB):
         self._lastUpdateTime = dt.datetime.now()
         # self.updateEvent += self._handle_expired_pairOrders
 
-    def placePairTrade(self, pairInstruments, spread, buysell, vol=1, tolerant_timedelta=30):
-        return self._run(self.placePairTradeAsync(pairInstruments, spread, buysell, vol, tolerant_timedelta))
+    def placePairTrade(self, *pairOrderArgs):
+        pairTradeAsync = [self.placePairTradeAsync(*args) for args in pairOrderArgs]
+        return self._run(*pairTradeAsync)
 
     async def placePairTradeAsync(self, pairInstruments, spread, buysell, vol=1, tolerant_timedelta=30):
         assert buysell in ['BUY', 'SELL']
@@ -156,16 +157,16 @@ class PairTrader(IB):
         po.tickers = {t.contract.conId: t for t in tickers}
 
         # 组合单预处理
-        from operator import lt, gt
-        comp = lt if buysell == 'BUY' else gt  # 小于价差买进组合，大于价差卖出组合
+        from operator import le, ge
+        comp = le if buysell == 'BUY' else ge  # 小于价差买进组合，大于价差卖出组合
         if buysell == 'BUY':
-            comp = lt
+            comp = le
             ins1_direction = 'BUY'
             ins1_price = 'ask'
             ins2_direction = 'SELL'
             ins2_price = 'bid'
         else:
-            comp = gt
+            comp = ge
             ins1_direction = 'SELL'
             ins1_price = 'bid'
             ins2_direction = 'BUY'
