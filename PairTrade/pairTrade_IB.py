@@ -9,11 +9,159 @@ from ib_insync import *
 import logging
 import uuid
 from collections import OrderedDict, ChainMap
+import numpy as np
+from KRData.HKData import HKFuture
 import datetime as dt
 import asyncio
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.ERROR)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger('IBTrader')
+
+from typing import List, Dict
+
+
+def get_ticks(contract, start, end, host='127.0.0.1', port=7497, clientId=16):
+    from collections import deque
+    from ib_insync import IB, util
+    ib = IB()
+    ib.connect(host, port, clientId, timeout=10)
+    ib.qualifyContracts(contract)
+    print(f'{contract}Downloading...... Start:{start} - To: {end}   from:{host}:{port}#{clientId}')
+    data = deque()
+    last_time = end
+    while True:
+        ticks = ib.reqHistoricalTicks(contract, '', last_time, 1000, 'Bid_Ask', useRth=False, ignoreSize=True)
+        last_time = ticks[0].time
+        print(last_time)
+        ticks.reverse()
+        data.extendleft(ticks)
+
+        if last_time.astimezone() < start.astimezone():
+            while data[0].time.astimezone() < start.astimezone():
+                data.popleft()
+            break
+
+    ib.disconnect()
+    return util.df(data)
+
+class tradeSession:
+    class Session(List):
+        def __init__(self):
+            super().__init__()
+
+        def __str__(self):
+            if self.__len__() != 0:
+                _from = self.__getitem__(0).time
+                _to = self.__getitem__(-1).time
+            else:
+                _from = ''
+                _to = ''
+            return f'From: {_from} - To: {_to} <Profit:{self.profit} NetPos:{self.netPos}>'
+
+        def items(self):
+            return [{'datetime': f.time ,'price': f.execution.price,
+                     'qty': f.execution.shares, 'side': f.execution.side, 'commission': f.commissionReport.commission} for f in self.__iter__()]
+
+        __repr__ = __str__
+
+        @property
+        def profit(self):
+            profit = 0
+            total_qty = 0
+            if self.__len__() != 0:
+                for f in self.__iter__():
+                    qty = f.execution.shares
+                    if f.execution.side == 'SLD':
+                        profit += f.execution.price * qty * float(f.contract.multiplier) - f.commissionReport.commission
+                        total_qty -= qty
+                    else:
+                        profit -= f.execution.price * qty * float(f.contract.multiplier) - f.commissionReport.commission
+                        total_qty += qty
+
+                profit += total_qty * f.execution.price * float(f.contract.multiplier) - f.commissionReport.commission
+            return profit
+
+        @property
+        def netPos(self):
+            pos = sum(f.execution.shares if f.execution.side == 'BOT' else - f.execution.shares for f in self.__iter__())
+            return pos
+
+        @property
+        def longQty(self):
+            qty = sum(f.execution.shares for f in self.__iter__() if f.execution.side == 'BOT')
+            return qty
+
+        @property
+        def shortQty(self):
+            qty = sum(f.execution.shares for f in self.__iter__() if f.execution.side == 'SLD')
+            return qty
+
+    def __init__(self):
+        self.__trade_data = dict()
+        self.__current_session = dict()
+        self.__historical_sessions = dict()
+
+    def init(self, fills):
+        for f in sorted(fills, key=lambda x: x.time):
+            self.addNewFill(f)
+
+    def handleSession(self, fill):
+        contract = fill.contract
+        cs = self.__current_session.setdefault(contract, self.Session())
+        hs = self.__historical_sessions.setdefault(contract, [])
+        cs.append(fill)
+        if cs.netPos == 0:
+            hs.append(cs)
+            self.__current_session[contract] = self.Session()
+
+    def addNewFill(self, newFill):
+        td = self.__trade_data.setdefault(newFill.contract, [])
+        td.append(newFill)
+        self.handleSession(newFill)
+
+    @property
+    def currentSession(self):
+        return self.__current_session
+
+    @property
+    def tradeData(self):
+        return self.__trade_data
+
+    @property
+    def historicalSessions(self):
+        return self.__historical_sessions
+
+    def __str__(self):
+        text = ""
+        text += "HistorySession\n"
+        for c in self.__historical_sessions:
+            text += f'  {c.localSymbol}:\n'
+            for i, sess in enumerate(self.__historical_sessions[c]):
+                text += f'      #{i} {sess}\n'
+
+        text += "\nCurrentSession\n"
+        for c, sess in self.__current_session.items():
+            text += f'  {c.localSymbol}:\n      {sess}\n'
+
+        return text
+
+    def __getitem__(self, item):
+        for c in self.__trade_data:
+            if item == c.localSymbol:
+                return {'historicalSessions': self.__historical_sessions.get(c),
+                        'currentSession': self.__current_session.get(c)}
+        else:
+            raise IndexError
+
+    def __getattr__(self, item):
+        for c in self.__trade_data:
+            if item == c.localSymbol:
+                return {'historicalSessions': self.__historical_sessions.get(c),
+                        'currentSession': self.__current_session.get(c)}
+        else:
+            raise AttributeError
+
+    __repr__ = __str__
 
 
 class PairOrders:
@@ -133,12 +281,21 @@ class PairOrders:
 class PairTrader(IB):
     def __init__(self, host, port, clientId=0, timeout=10):
         super(PairTrader, self).__init__()
-        self.connect(host, port, clientId=clientId, timeout=timeout)
-
-        self._pairOrders_running = []  #List:
+        self._pairOrders_running = []  # List:
         self._pairOrders_finished = []
         self._lastUpdateTime = dt.datetime.now()
         # self.updateEvent += self._handle_expired_pairOrders
+        self.tradeSession = tradeSession()
+        self.execDetailsEvent += self.updateTradeSession
+        self.connectedEvent += lambda: self.tradeSession.init(self.fills())  # 用于初始化tradeSession
+
+        self.connect(host, port, clientId=clientId, timeout=timeout)
+
+    def updateTradeSession(self, trade, fill):
+        self.tradeSession.addNewFill(fill)
+
+    def placeMarketFHedge(self, contracts, action, price, vol):
+        lmt_order = LimitOrder(action, vol, price)
 
     def placePairTrade(self, *pairOrderArgs):
         pairTradeAsync = [self.placePairTradeAsync(*args) for args in pairOrderArgs]
@@ -188,8 +345,8 @@ class PairTrader(IB):
             price2 = getattr(tickers[1], ins2_price)
             current_spread = price1 - price2
             if comp(current_spread, spread):
-                ins1_lmt_order = LimitOrder(ins1_direction, vol, price1)
-                ins2_lmt_order = LimitOrder(ins2_direction, vol, price2)
+                ins1_lmt_order = LimitOrder(ins1_direction, vol, price1, orderRef='pt-Forward->[]')
+                ins2_lmt_order = LimitOrder(ins2_direction, vol, price2, orderRef='pt-Guard->[]')
                 trade1 = self.placeOrder(tickers[0].contract, ins1_lmt_order)
                 trade2 = self.placeOrder(tickers[1].contract, ins2_lmt_order)
                 self.pendingTickersEvent -= po
@@ -216,6 +373,175 @@ class PairTrader(IB):
         for t in self.tickers():
             if pairOrders in t.updateEvent:
                 t.updateEvent -= pairOrders
+
+    def visualizeSession(self, session, barSize='1 min'):
+        from pyecharts import Kline, Page, Line, Overlap, HeatMap, Grid, Bar
+        import talib
+        from math import ceil
+        def kline_tooltip(params):
+            # s = params[0].seriesName + '</br>'
+            d = params[0].name + '</br>'
+            o = '开: ' + params[0].data[1] + '</br>'
+            h = '高: ' + params[0].data[4] + '</br>'
+            l = '低: ' + params[0].data[3] + '</br>'
+            c = '收: ' + params[0].data[2] + '</br>'
+            text = d + o + h + l + c
+            return text
+
+        def label_tooltip(params):
+            text = params.data.coord[2] + '@[' + params.data.coord[1] + ']'
+            return text
+
+        trade_lines_raw = []
+        pos = 0
+        p_pos = 0
+        for i in range(len(session)):
+            exec1 = session[i].execution
+            pos += (exec1.shares if exec1.side == 'BOT' else -exec1.shares)
+            for j in range(i + 1, len(session)):
+                exec2 = session[j].execution
+                if exec1.side != exec2.side:
+                    p_pos += (exec2.shares if exec2.side == 'BOT' else -exec2.shares)
+                    if abs(pos) > abs(p_pos):
+                        continue
+                    trade_lines_raw.append([exec1, exec2])
+                    p_pos = 0
+                    break
+
+        # for i, f in enumerate(session):
+        #     exec = f.execution
+        #     current_pos = (exec.shares if exec.side == 'BOT' else -exec.shares)
+        #     pos += current_pos
+        #     trade_lines_raw.append([i, current_pos])
+        #     if len(trade_lines_raw) >=2:
+        #         net = trade_lines_raw[-1][1] + trade_lines_raw[-2][1]
+        #         if net == 0 :
+        #             last1 = trade_lines_raw.pop()
+        #             last2 = trade_lines_raw.pop()
+        #             yield last2, last1
+        #         else:
+        #             last1 = trade_lines_raw.pop()
+        #             last2 = trade_lines_raw[-1]
+        #             yield last2.copy(), last1
+        #             last2[1] = net
+
+
+        trade_points = [{'coord': [str(f.time.astimezone().strftime('%Y-%m-%d %H:%M:00')), f.execution.price, f.execution.shares],
+                         'name': 'trade',
+                         'label': {'show': True, 'formatter': label_tooltip, 'offset': [0, -30], 'fontSize': 15,
+                                   'fontFamily': 'monospace', 'color': 'black'},
+                         'symbol': 'triangle',
+                         'symbolSize': 8 + 3 * f.execution.shares,
+                         'symbolKeepAspect': False,
+                         'itemStyle': {'color': 'blue' if f.execution.side == 'BOT' else 'green'},
+                         'emphasis': {
+                             'label': {'show': True, 'formatter': label_tooltip, 'offset': [0, -30], 'fontSize': 30,
+                                       'fontFamily': 'monospace', 'color': 'black', 'fontWeight': 'bolder'},
+                             'itemStyle': {'color': 'black'}},
+                         'symbolRotate': 0 if f.execution.side == 'BOT' else 180} for f in session]
+
+        trade_lines = [[{'coord': [str(exec1.time.astimezone().strftime('%Y-%m-%d %H:%M:00')), exec1.price],
+                         'lineStyle': {'type': 'dashed',
+                                       'color': 'red' if ((exec2.price - exec1.price) if exec2.side == 'SELL'
+                                                          else (exec1.price - exec2.price)) >= 0 else 'green'},
+
+                         'emphasis': {'lineStyle': {'type': 'dashed',
+                                                    'color': 'red' if ((
+                                                                               exec2.price - exec1.price) if exec2.side == 'SELL'
+                                                                       else (
+                                                            exec1.price - exec2.price)) >= 0 else 'green',
+                                                    'width': 2 + 0.1 * abs(exec2.price - exec1.price) * abs(
+                                                        exec1.shares)},
+                                      'label': {'show': True,
+                                                'formatter': f'{abs(exec2.price - exec1.price)*abs(exec1.shares)}',
+                                                'position': 'middle', 'fontSize': 25, }},
+                         },
+                        {'coord': [str(exec2.time.astimezone().strftime('%Y-%m-%d %H:%M:00')), exec2.price],
+                         'lineStyle': {'type': 'dashed',
+                                       'color': 'red' if ((exec2.price - exec1.price) if exec2.side == 'SELL'
+                                                          else (exec1.price - exec2.price)) >= 0 else 'green', },
+
+                         'emphasis': {'lineStyle': {'type': 'dashed',
+                                                    'color': 'red' if ((
+                                                                               exec2.price - exec1.price) if exec2.side == 'SELL'
+                                                                       else (
+                                                            exec1.price - exec2.price)) >= 0 else 'green',
+                                                    'width': 2 + 0.1 * abs(exec2.price - exec1.price) * abs(
+                                                        exec1.shares)},
+                                      'label': {'show': True,
+                                                'formatter': f'{abs(exec2.price - exec1.price)*abs(exec1.shares)}',
+                                                'position': 'middle', 'fontSize': 25, }
+                                      },
+                         }] for exec1, exec2 in trade_lines_raw]
+
+        _from = session[0].time - dt.timedelta(minutes=60)
+        _to = session[-1].time + dt.timedelta(minutes=60)
+        contract = session[0].contract
+        total_seconds = int((_to - _from).total_seconds())
+        raw_data = self.reqHistoricalData(contract, _to, f'{total_seconds} S' if total_seconds <=86400 else f'{ceil(total_seconds/86400)} D',
+                                          barSize, 'TRADES', useRTH=False)
+
+        data = util.df(raw_data)[['date', 'open', 'close', 'low', 'high']]
+        _bars = data.values.transpose()
+        x_axis = _bars[0].astype(str)
+
+        kline = Kline(f'{contract.localSymbol}-1min KLine    {session}')
+        kline.add(
+            f'{contract.localSymbol}',
+            x_axis,
+            _bars[1:].T,
+            mark_point_raw=trade_points,
+            mark_line_raw=trade_lines,
+            # label_formatter=label_tooltip,
+            # xaxis_type='category',
+            tooltip_trigger='axis',
+            tooltip_formatter=kline_tooltip,
+            is_datazoom_show=True,
+            datazoom_range=[0, 100],
+            datazoom_type='horizontal',
+            is_more_utils=True)
+
+        overlap_kline = Overlap('KLine', width='1500px', height='600px')
+        overlap_kline.add(kline)
+
+        _close = _bars[2].astype(float)
+        MA = {}
+        for w in [5, 10, 30, 60]:
+            try:
+                ma = talib.MA(_close, timeperiod=w)
+            except Exception as e:
+                ...
+            else:
+                MA[w] = Line(f'MA{w}')
+                MA[w].add(f'MA{w}',
+                          x_axis,
+                          np.round(ma, 2),
+                          is_symbol_show=False,
+                          is_smooth=True
+                          )
+                overlap_kline.add(MA[w])
+
+        macdDIFF, macdDEA, macd = talib.MACDEXT(_close, fastperiod=12, fastmatype=1,
+                                                slowperiod=26, slowmatype=1,
+                                                signalperiod=9, signalmatype=1)
+        diff_line = Line('diff')
+        dea_line = Line('dea')
+        macd_bar = Bar('macd')
+        diff_line.add('diff', x_axis, macdDIFF, line_color='yellow', is_symbol_show=False, is_smooth=True)
+        dea_line.add('diff', x_axis, macdDEA, line_color='blue', is_symbol_show=False, is_smooth=True)
+        macd_bar.add('macd', x_axis, macd, is_visualmap=True, visual_type='color', is_piecewise=True,
+                     pieces=[{max: 0}, {min: 0}])
+
+        overlap_macd = Overlap('MACD', width='1500px', height='200px')
+        overlap_macd.add(diff_line)
+        overlap_macd.add(dea_line)
+        overlap_macd.add(macd_bar)
+
+        grid = Grid('Anlysis', width='1500px', height='1000px')
+        grid.add(overlap_kline, grid_top='10%', grid_bottom='25%')
+        grid.add(overlap_macd, grid_top='80%')
+
+        return grid
 
     async def unfilled_order_handle(self, pairOrder):  # 报单成交处理逻辑，***整个交易对保单之后的逻辑都在这里处理
         try:
