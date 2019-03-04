@@ -689,14 +689,14 @@ class PairTrader(IB):
             if pnl >0:
                 for key, trade in ChainMap(po.trades, po.extra_trades).items():
                     if trade.isActive():  # 把队列中的报单删除
-                        self._close_after_del(trade.order)
+                        self._close_after_del(trade)
                 else:
                     po.finishedEvent.emit()
                     return
 
             if net == 0:
                 logger.info(
-                    f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 已盈利点数->{pnl}， 撤销未完全成交报单')
+                    f'<_handle_expired_pairOrders>pairOrders:{po.id} 净暴露头寸：{net} 已盈利点数->{pnl}， 撤销未完全成交报单')
                 for key, trade in ChainMap(po.trades, po.extra_trades).items():
                     if trade.isActive():  # 把队列中的报单删除
                         self.cancelOrder(trade.order)
@@ -705,14 +705,14 @@ class PairTrader(IB):
 
             elif net > 0:
                 logger.info(
-                    f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 理论盈利点数->{pnl}， 撤销所有报单，并平掉暴露仓位')
+                    f'<_handle_expired_pairOrders>pairOrders:{po.id} 净暴露头寸：{net} 理论盈利点数->{pnl}， 撤销所有报单，并平掉暴露仓位')
                 for key, trade in ChainMap(po.trades, po.extra_trades).items():
                     if trade.isActive():  # 把队列中的报单删除
                         self._modify_to_op_price(trade, net)
 
             elif net < 0:
                 logger.info(
-                    f'<_handle_expired_pairOrders>pairOrders:{pairOrders.id} 净暴露头寸：{net} 理论盈利点数->{pnl}， 撤销所有报单，并平掉暴露仓位')
+                    f'<_handle_expired_pairOrders>pairOrders:{po.id} 净暴露头寸：{net} 理论盈利点数->{pnl}， 撤销所有报单，并平掉暴露仓位')
                 for key, trade in ChainMap(po.trades, po.extra_trades).items():
                     if trade.isActive():  # 把队列中的报单删除
                         self._modify_to_op_price(trade, net)
@@ -723,10 +723,10 @@ class PairTrader(IB):
         # def insert_after_cancel(t): # 收到订单取消时间后，马上报新单
         if net < 0:
             action = 'BUY'
-            price = getattr(self.wrapper.tickers[id(t.contract)], 'ask')
+            price = getattr(self.wrapper.tickers[id(trade.contract)], 'ask')
         elif net > 0:
             action = 'SELL'
-            price = getattr(self.wrapper.tickers[id(t.contract)], 'bid')
+            price = getattr(self.wrapper.tickers[id(trade.contract)], 'bid')
 
         # lmt_order = LimitOrder(action, abs(net), price)
         lmt_order = trade.order
