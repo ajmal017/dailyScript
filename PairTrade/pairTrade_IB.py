@@ -419,7 +419,7 @@ class PairTrader(IB):
             nonlocal isFirst
             # lmt_order.lmtPrice = int(trade.orderStatus.avgFillPrice + pairOrders.spread)
             lmt_order.lmtPrice = getattr(gTicker, gTicker_type, -1)
-            lmt_order.totalQuantity = trade.orderStatus.filled
+            lmt_order.totalQuantity = trade.filled()
             guard_trade = self.placeOrder(contract, lmt_order)
             if isFirst:
                 pairOrders.set_init_time()
