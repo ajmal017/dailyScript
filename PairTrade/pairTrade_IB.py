@@ -14,7 +14,7 @@ from KRData.HKData import HKFuture
 import datetime as dt
 import asyncio
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.ERROR)
 logger = logging.getLogger('IBTrader')
 
 from typing import List, Dict
@@ -229,7 +229,7 @@ class PairOrders:
         total_pnl = 0
         if not self._isFinished:
             for ref, t in ChainMap(self.trades, self.extra_trades).items():
-                ticker = self.tickers[t.contract.conId]
+                ticker = self.tickers[t.contract]
                 _filled = t.filled()
                 if t.order.action == 'BUY':
                     pos += _filled
@@ -393,7 +393,6 @@ class PairTrader(IB):
 
             if isFirst:
                 forward_trade.filledEvent += pairOrders._put_filled
-                pairOrders.set_init_time()
                 isFirst = False
                 pairOrders.trades[key] = forward_trade
 
@@ -423,6 +422,7 @@ class PairTrader(IB):
             lmt_order.totalQuantity = trade.orderStatus.filled
             guard_trade = self.placeOrder(contract, lmt_order)
             if isFirst:
+                pairOrders.set_init_time()
                 guard_trade.filledEvent += pairOrders._put_filled
                 isFirst = False
                 pairOrders.trades[key] = guard_trade
