@@ -14,7 +14,7 @@ from KRData.HKData import HKFuture
 import datetime as dt
 import asyncio
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.WARNING)
+# logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.WARNING)
 logger = logging.getLogger('IBTrader')
 
 from typing import List, Dict
@@ -210,10 +210,8 @@ class PairOrders:
             await asyncio.sleep(0.1)
             netPos = 0
             for  key, trade in self.trades.items():
-                print(f'filled:{trade.filled()}')
                 netPos += trade.filled() * (1 if trade.order.action == 'BUY' else -1)
             else:
-                print(f'netPos:{netPos}')
                 if netPos == 0:
                     return True
 
@@ -307,6 +305,38 @@ class PairTrader(IB):
         pairTradeAsync = [self.placePairTradeAsync(*args) for args in pairOrderArgs]
         return self._run(*pairTradeAsync)
 
+    async def CalendarSpreadArbitrage(self, pairInstruments, longSpread, ShortSpread, vol=1,
+                                      RTH=True):
+        util.logToFile('PairTrade.log', logging.WARNING)
+        insts = self.qualifyContracts(*pairInstruments)
+        assert len(insts) == 2, "无法确认合约"
+
+        async def runStategy():
+            po = []
+            tradeTimeRange = self.initTradeTime(dt.datetime.now(), RTH)
+            start = tradeTimeRange[0][0]
+            end = tradeTimeRange[-1][1]
+            async for t in util.timeRangeAsync(start, end, 1):
+                if t > tradeTimeRange[0][1]:
+                    tradeTimeRange.pop(0)
+                    continue
+                elif t < tradeTimeRange[0][0]:
+                    continue
+
+                to = (tradeTimeRange[0][1] - t).total_seconds()
+                longTask = self.placePairTradeAsync(insts, longSpread, 'BUY', vol)
+                shortTask = self.placePairTradeAsync(insts, ShortSpread, 'SELL', vol)
+                try:
+                    done, pending = await asyncio.wait([longTask, shortTask], timeout=to)
+                except TimeoutError:
+                    print('策略时间结束')
+                finally:
+                    po.extend(done)
+            return po
+
+        return await runStategy()
+
+
     async def placePairTradeAsync(self, pairInstruments, spread, buysell, vol=1, tolerant_timedelta=30):
         assert buysell in ['BUY', 'SELL']
         # ins1, ins2 = pairInstruments
@@ -344,11 +374,13 @@ class PairTrader(IB):
         placeGOrder = self.initGuardOrder(po)
 
         def arbitrage(pendingTickers):  # 套利下单判断
-            if all(ticker not in tickers for ticker in pendingTickers):
-                print('no ticker')
+            # if all(ticker not in tickers for ticker in pendingTickers):
+            #     logger.warning('<arbitrage>no ticker yet')
+            #     return
+            price1 = getattr(tickers[0], ins1_price, -1)
+            price2 = getattr(tickers[1], ins2_price, -1)
+            if price1 == -1 or price2 == -1:
                 return
-            # price1 = getattr(tickers[0], ins1_price)
-            # price2 = getattr(tickers[1], ins2_price)
             # current_spread = price1 - price2
             # if comp(current_spread, spread):
             #             #     forward_trade = placeFOrder()
@@ -390,7 +422,6 @@ class PairTrader(IB):
             forward_trade = pairOrders.trades.get(key)
             price = gTicker_price - pairOrders.spread
             if forward_trade is None or not forward_trade.isDone() and lmt_order.lmtPrice != price:
-                print(f'origin:{lmt_order.lmtPrice} modified:{price}')
                 lmt_order.lmtPrice = price
                 forward_trade = self.placeOrder(contract, lmt_order)
 
@@ -754,9 +785,21 @@ class PairTrader(IB):
 
         trade.cancelledEvent += insert_after_cancel
         self.cancelOrder(trade.order)
-
-
-
+    @staticmethod
+    def initTradeTime(now, OnlyRTH=True):
+        today = dt.date.today()
+        forenoon = [dt.datetime.combine(today, dt.time(9, 15)), dt.datetime.combine(today, dt.time(11, 59, 59))]
+        afternoon = [dt.datetime.combine(today, dt.time(13, 0)), dt.datetime.combine(today, dt.time(15, 59, 59))]
+        afterRTH = [dt.datetime.combine(today, dt.time(17, 15)), dt.datetime.combine(today, dt.time(23, 59, 59))]
+        tradeTime = [forenoon, afternoon]
+        if not OnlyRTH:
+            tradeTime.append(afterRTH)
+        for td in tradeTime:
+            if now > td[1]:
+                tradeTime.remove(td)
+            elif now > td[0]:
+                td[0] = now
+        return tradeTime
 
 if __name__ == '__main__':
     ib = IB()
