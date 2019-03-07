@@ -13,9 +13,18 @@ import numpy as np
 from KRData.HKData import HKFuture
 import datetime as dt
 import asyncio
+from ibapi.decoder import Decoder
+import struct
 
-# logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.WARNING)
+# logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+util.logToFile('PairTrade.log', logging.WARNING)
 logger = logging.getLogger('IBTrader')
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(stream_handler)
+logger.setLevel(logging.INFO)
+
+
 
 from typing import List, Dict
 
@@ -164,7 +173,6 @@ class tradeSession:
 
     __repr__ = __str__
 
-
 class PairOrders:
     events = ('orderUpdateEvent', 'allFilledEvent',
               'forwardFillEvent', 'guardFillEvent',
@@ -294,12 +302,13 @@ class PairTrader(IB):
         self.connectedEvent += lambda: self.tradeSession.init(self.fills())  # 用于初始化tradeSession
 
         self.connect(host, port, clientId=clientId, timeout=timeout)
+        self._last_pairOrders = []
 
     def updateTradeSession(self, trade, fill):
         self.tradeSession.addNewFill(fill)
 
-    def placeMarketFHedge(self, contracts, action, price, vol):
-        lmt_order = LimitOrder(action, vol, price)
+    # def placeMarketFHedge(self, contracts, action, price, vol):
+    #     lmt_order = LimitOrder(action, vol, price)
 
     def placePairTrade(self, *pairOrderArgs):
         pairTradeAsync = [self.placePairTradeAsync(*args) for args in pairOrderArgs]
@@ -307,12 +316,11 @@ class PairTrader(IB):
 
     async def CalendarSpreadArbitrage(self, pairInstruments, longSpread, ShortSpread, vol=1,
                                       RTH=True):
-        util.logToFile('PairTrade.log', logging.WARNING)
         insts = self.qualifyContracts(*pairInstruments)
         assert len(insts) == 2, "无法确认合约"
 
-        async def runStategy():
-            po = []
+        async def runStrategy():
+            self._last_pairOrders = []
             tradeTimeRange = self.initTradeTime(dt.datetime.now(), RTH)
             start = tradeTimeRange[0][0]
             end = tradeTimeRange[-1][1]
@@ -320,26 +328,27 @@ class PairTrader(IB):
                 if t > tradeTimeRange[0][1]:
                     tradeTimeRange.pop(0)
                     continue
-                elif t < tradeTimeRange[0][0]:
+                elif t < tradeTimeRange[0][0] or t < dt.datetime.now() - dt.timedelta(seconds=1):
                     continue
 
                 to = (tradeTimeRange[0][1] - t).total_seconds()
+                logger.info(f'<CalendarSpreadArbitrage>new loop -> {to}seconds to pause the strategy')
                 longTask = self.placePairTradeAsync(insts, longSpread, 'BUY', vol)
                 shortTask = self.placePairTradeAsync(insts, ShortSpread, 'SELL', vol)
                 try:
                     done, pending = await asyncio.wait([longTask, shortTask], timeout=to)
                 except TimeoutError:
-                    print('策略时间结束')
+                    logger.info(f'<CalendarSpreadArbitrage>new loop -> {to}seconds to pause the strategy')
+                    # 这里需要做撸平暴露仓位，取消未成交报单的操作
                 finally:
-                    po.extend(done)
-            return po
+                    self._last_pairOrders.extend(done)
+            return self._last_pairOrders
 
-        return await runStategy()
+        return await runStrategy()
 
 
-    async def placePairTradeAsync(self, pairInstruments, spread, buysell, vol=1, tolerant_timedelta=30):
+    async def placePairTradeAsync(self, pairInstruments, spread, buysell, vol=1, tolerant_timedelta=90):
         assert buysell in ['BUY', 'SELL']
-        # ins1, ins2 = pairInstruments
         tickers = [None, None]
         for i, ins in enumerate(pairInstruments):
             tickers[i] = self.ticker(ins)
@@ -390,7 +399,6 @@ class PairTrader(IB):
             forward_trade = placeFOrder()
             if placeGOrder not in forward_trade.fillEvent:
                 forward_trade.fillEvent += placeGOrder
-
 
         po._trigger = arbitrage
         self.pendingTickersEvent += po
